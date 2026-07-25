@@ -25,14 +25,18 @@ use secretd::{
 
 use crate::icon::{TrayStatus, tray_icon};
 
-const BACKGROUND: Color32 = Color32::from_rgb(243, 245, 242);
+const BACKGROUND: Color32 = Color32::from_rgb(245, 247, 245);
 const SURFACE: Color32 = Color32::WHITE;
-const INK: Color32 = Color32::from_rgb(23, 32, 28);
-const MUTED: Color32 = Color32::from_rgb(101, 113, 106);
-const LINE: Color32 = Color32::from_rgb(220, 225, 221);
-const GREEN: Color32 = Color32::from_rgb(22, 155, 99);
+const SURFACE_MUTED: Color32 = Color32::from_rgb(249, 250, 249);
+const INK: Color32 = Color32::from_rgb(21, 33, 27);
+const MUTED: Color32 = Color32::from_rgb(99, 113, 105);
+const LINE: Color32 = Color32::from_rgb(218, 225, 221);
+const LINE_STRONG: Color32 = Color32::from_rgb(190, 201, 195);
+const GREEN: Color32 = Color32::from_rgb(20, 139, 94);
+const GREEN_SOFT: Color32 = Color32::from_rgb(230, 245, 237);
 const AMBER: Color32 = Color32::from_rgb(216, 145, 34);
 const RED: Color32 = Color32::from_rgb(202, 67, 67);
+const RED_SOFT: Color32 = Color32::from_rgb(255, 241, 241);
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -86,6 +90,7 @@ pub struct SecretDApp {
     auth_password: Zeroizing<String>,
     auth_confirmation: Zeroizing<String>,
     auth_error: Option<String>,
+    auth_focus_requested: bool,
     search: String,
     group_filter: Option<String>,
     secret_draft: Option<SecretDraft>,
@@ -163,6 +168,7 @@ impl SecretDApp {
             auth_password: Zeroizing::new(String::new()),
             auth_confirmation: Zeroizing::new(String::new()),
             auth_error: None,
+            auth_focus_requested: false,
             search: String::new(),
             group_filter: None,
             secret_draft: None,
@@ -264,61 +270,120 @@ impl SecretDApp {
         let enter = ui.ctx().input(|input| input.key_pressed(egui::Key::Enter));
         Frame::new().fill(BACKGROUND).show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(90.0);
+                let estimated_height = if creating { 430.0 } else { 350.0 };
+                ui.add_space(((ui.available_height() - estimated_height) / 2.0).max(20.0));
                 Frame::new()
                     .fill(SURFACE)
                     .stroke(Stroke::new(1.0, LINE))
-                    .corner_radius(18)
-                    .inner_margin(Margin::same(28))
+                    .corner_radius(20)
+                    .inner_margin(Margin::same(32))
                     .show(ui, |ui| {
-                        ui.set_width(390.0);
-                        ui.label(RichText::new("S").size(28.0).strong().color(GREEN));
-                        ui.add_space(8.0);
-                        ui.heading(if creating {
-                            "Create your vault"
-                        } else {
-                            "Welcome back"
-                        });
-                        ui.label(
-                            RichText::new(if creating {
-                                "Secret names and values are encrypted together."
-                            } else {
-                                "Unlock SecretD to manage and approve credentials."
-                            })
-                            .color(MUTED),
-                        );
-                        ui.add_space(18.0);
-                        field_label(ui, "Master password");
-                        let password = ui.add(
-                            TextEdit::singleline(&mut *self.auth_password)
-                                .password(true)
-                                .desired_width(f32::INFINITY),
-                        );
-                        if creating {
-                            field_label(ui, "Confirm password");
-                            ui.add(
-                                TextEdit::singleline(&mut *self.auth_confirmation)
-                                    .password(true)
-                                    .desired_width(f32::INFINITY),
+                        ui.set_width(420.0);
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                brand_mark(ui);
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new("SecretD")
+                                            .size(17.0)
+                                            .strong()
+                                            .color(INK),
+                                    );
+                                    ui.label(
+                                        RichText::new("LOCAL ENCRYPTED VAULT")
+                                            .size(10.0)
+                                            .strong()
+                                            .color(MUTED),
+                                    );
+                                });
+                            });
+                            ui.add_space(24.0);
+                            ui.label(
+                                RichText::new(if creating {
+                                    "Create your vault"
+                                } else {
+                                    "Welcome back"
+                                })
+                                .size(26.0)
+                                .strong()
+                                .color(INK),
                             );
-                        }
-                        if let Some(error) = &self.auth_error {
-                            ui.colored_label(RED, error);
-                        }
-                        ui.add_space(8.0);
-                        let submit = primary_button(
-                            ui,
+                            ui.label(
+                                RichText::new(if creating {
+                                    "Protect credentials in an encrypted vault that stays on this Mac."
+                                } else {
+                                    "Unlock your vault to manage credentials and approve access."
+                                })
+                                .size(14.0)
+                                .color(MUTED),
+                            );
+                            ui.add_space(22.0);
+                            field_label(ui, "Master password");
+                            let password = singleline_field(
+                                ui,
+                                &mut *self.auth_password,
+                                "Enter your master password",
+                                true,
+                                f32::INFINITY,
+                            );
+                            if !self.auth_focus_requested {
+                                password.request_focus();
+                                self.auth_focus_requested = true;
+                            }
+                            ui.label(
+                                RichText::new(if creating {
+                                    "Use a password you can remember. It never leaves this device."
+                                } else {
+                                    "Your password is only used to decrypt the local vault."
+                                })
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                            let mut confirmation_focused = false;
                             if creating {
-                                "Create encrypted vault"
-                            } else {
-                                "Unlock vault"
-                            },
-                        )
-                        .clicked()
-                            || (enter && password.has_focus());
-                        if submit {
-                            self.submit_auth(creating);
-                        }
+                                ui.add_space(8.0);
+                                field_label(ui, "Confirm password");
+                                let confirmation = singleline_field(
+                                    ui,
+                                    &mut *self.auth_confirmation,
+                                    "Enter it again",
+                                    true,
+                                    f32::INFINITY,
+                                );
+                                confirmation_focused = confirmation.has_focus();
+                            }
+                            if let Some(error) = &self.auth_error {
+                                ui.add_space(4.0);
+                                error_banner(ui, error);
+                            }
+                            ui.add_space(12.0);
+                            let ready = !self.auth_password.is_empty()
+                                && (!creating || !self.auth_confirmation.is_empty());
+                            let submit = full_primary_button(
+                                ui,
+                                if creating {
+                                    "Create encrypted vault"
+                                } else {
+                                    "Unlock vault"
+                                },
+                                ready,
+                            )
+                            .clicked()
+                                || (enter
+                                    && ready
+                                    && (password.has_focus() || confirmation_focused));
+                            if submit {
+                                self.submit_auth(creating);
+                            }
+                            ui.add_space(6.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    RichText::new("AES-256 encrypted • PBKDF2 protected")
+                                        .size(10.0)
+                                        .color(MUTED),
+                                );
+                            });
+                        });
                     });
             });
         });
@@ -358,11 +423,16 @@ impl SecretDApp {
     fn workspace_ui(&mut self, ui: &mut egui::Ui, snapshot: AppSnapshot) {
         Frame::new()
             .fill(SURFACE)
-            .inner_margin(Margin::symmetric(24, 14))
+            .stroke(Stroke::new(1.0, LINE))
+            .inner_margin(Margin::symmetric(28, 16))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("SecretD").size(20.0).strong().color(INK));
-                    ui.label(RichText::new("Vault unlocked").small().color(GREEN));
+                    brand_mark(ui);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("SecretD").size(18.0).strong().color(INK));
+                        ui.label(RichText::new("Local credential vault").small().color(MUTED));
+                    });
+                    status_pill(ui, "Vault unlocked", GREEN, GREEN_SOFT);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if secondary_button(ui, "Lock").clicked() {
                             self.lock();
@@ -376,7 +446,7 @@ impl SecretDApp {
                         }
                     });
                 });
-                ui.add_space(10.0);
+                ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     nav_button(
                         ui,
@@ -412,7 +482,7 @@ impl SecretDApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 Frame::new()
-                    .inner_margin(Margin::symmetric(36, 28))
+                    .inner_margin(Margin::symmetric(36, 30))
                     .show(ui, |ui| match self.view {
                         View::Secrets => self.secrets_ui(ui, &snapshot),
                         View::Requests => self.requests_ui(ui, &snapshot),
@@ -429,10 +499,12 @@ impl SecretDApp {
             "Manage secrets and organize related access with groups.",
         );
         ui.horizontal(|ui| {
-            ui.add(
-                TextEdit::singleline(&mut self.search)
-                    .hint_text("Search credentials or groups…")
-                    .desired_width(310.0),
+            singleline_field(
+                ui,
+                &mut self.search,
+                "Search credentials or groups…",
+                false,
+                310.0,
             );
             let groups: Vec<_> = snapshot
                 .secrets
@@ -498,13 +570,13 @@ impl SecretDApp {
             Frame::new()
                 .fill(SURFACE)
                 .stroke(Stroke::new(1.0, LINE))
-                .corner_radius(12)
-                .inner_margin(Margin::same(14))
+                .corner_radius(14)
+                .inner_margin(Margin::same(16))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("S").size(16.0).strong().color(GREEN));
+                        credential_mark(ui);
                         ui.vertical(|ui| {
-                            ui.label(RichText::new(&secret.name).strong().color(INK));
+                            ui.label(RichText::new(&secret.name).size(14.0).strong().color(INK));
                             ui.label(
                                 RichText::new(secret.group.as_deref().unwrap_or("No group"))
                                     .small()
@@ -632,8 +704,8 @@ impl SecretDApp {
                     1.0,
                     if request.verified { LINE } else { AMBER },
                 ))
-                .corner_radius(12)
-                .inner_margin(Margin::same(16))
+                .corner_radius(14)
+                .inner_margin(Margin::same(18))
                 .show(ui, |ui| {
                     request_heading(ui, request);
                     ui.add_space(8.0);
@@ -750,8 +822,8 @@ impl SecretDApp {
             Frame::new()
                 .fill(SURFACE)
                 .stroke(Stroke::new(1.0, LINE))
-                .corner_radius(12)
-                .inner_margin(Margin::same(14))
+                .corner_radius(14)
+                .inner_margin(Margin::same(16))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
@@ -805,8 +877,8 @@ impl SecretDApp {
             Frame::new()
                 .fill(SURFACE)
                 .stroke(Stroke::new(1.0, LINE))
-                .corner_radius(10)
-                .inner_margin(Margin::same(12))
+                .corner_radius(14)
+                .inner_margin(Margin::same(14))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
@@ -863,32 +935,31 @@ impl SecretDApp {
         .show(context, |ui| {
             ui.set_width(460.0);
             field_label(ui, "Name");
-            ui.add(
-                TextEdit::singleline(&mut draft.name)
-                    .hint_text("service/account/token")
-                    .desired_width(f32::INFINITY),
+            singleline_field(
+                ui,
+                &mut draft.name,
+                "service/account/token",
+                false,
+                f32::INFINITY,
             );
             field_label(ui, "Group (optional)");
-            ui.add(
-                TextEdit::singleline(&mut draft.group)
-                    .hint_text("aws-read-only")
-                    .desired_width(f32::INFINITY),
-            );
+            singleline_field(ui, &mut draft.group, "aws-read-only", false, f32::INFINITY);
             field_label(ui, "Value");
             ui.add(
                 TextEdit::multiline(&mut *draft.value)
                     .desired_rows(6)
+                    .frame(input_frame())
                     .desired_width(f32::INFINITY),
             );
             if let Some(error) = &self.form_error {
-                ui.colored_label(RED, error);
+                error_banner(ui, error);
             }
-            ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if primary_button(ui, "Save credential").clicked() {
+                    save = true;
+                }
                 if secondary_button(ui, "Cancel").clicked() {
                     close = true;
-                }
-                if primary_button(ui, "Save").clicked() {
-                    save = true;
                 }
             });
         });
@@ -935,27 +1006,36 @@ impl SecretDApp {
             .resizable(false)
             .show(context, |ui| {
                 ui.set_width(400.0);
+                ui.label(
+                    RichText::new("Choose a new password for the encrypted local vault.")
+                        .color(MUTED),
+                );
+                ui.add_space(8.0);
                 field_label(ui, "New password");
-                ui.add(
-                    TextEdit::singleline(&mut *draft.password)
-                        .password(true)
-                        .desired_width(f32::INFINITY),
+                singleline_field(
+                    ui,
+                    &mut *draft.password,
+                    "Enter a new password",
+                    true,
+                    f32::INFINITY,
                 );
                 field_label(ui, "Confirm password");
-                ui.add(
-                    TextEdit::singleline(&mut *draft.confirmation)
-                        .password(true)
-                        .desired_width(f32::INFINITY),
+                singleline_field(
+                    ui,
+                    &mut *draft.confirmation,
+                    "Enter it again",
+                    true,
+                    f32::INFINITY,
                 );
                 if let Some(error) = &self.form_error {
-                    ui.colored_label(RED, error);
+                    error_banner(ui, error);
                 }
-                ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if primary_button(ui, "Update password").clicked() {
+                        save = true;
+                    }
                     if secondary_button(ui, "Cancel").clicked() {
                         close = true;
-                    }
-                    if primary_button(ui, "Save").clicked() {
-                        save = true;
                     }
                 });
             });
@@ -1072,6 +1152,7 @@ impl SecretDApp {
         self.password_draft = None;
         self.revealed = None;
         self.form_error = None;
+        self.auth_focus_requested = false;
     }
 }
 
@@ -1082,75 +1163,232 @@ pub fn background_color() -> [f32; 4] {
 pub fn configure_style(context: &egui::Context) {
     let mut visuals = egui::Visuals::light();
     visuals.panel_fill = BACKGROUND;
+    visuals.faint_bg_color = SURFACE_MUTED;
+    visuals.extreme_bg_color = SURFACE_MUTED;
+    visuals.text_edit_bg_color = Some(SURFACE);
+    visuals.override_text_color = Some(INK);
+    visuals.weak_text_color = Some(MUTED);
     visuals.window_fill = SURFACE;
     visuals.window_stroke = Stroke::new(1.0, LINE);
-    visuals.widgets.inactive.corner_radius = CornerRadius::same(9);
-    visuals.widgets.hovered.corner_radius = CornerRadius::same(9);
-    visuals.widgets.active.corner_radius = CornerRadius::same(9);
-    visuals.selection.bg_fill = GREEN;
+    visuals.window_corner_radius = CornerRadius::same(16);
+    visuals.menu_corner_radius = CornerRadius::same(12);
+    visuals.widgets.inactive.corner_radius = CornerRadius::same(10);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, LINE_STRONG);
+    visuals.widgets.hovered.corner_radius = CornerRadius::same(10);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, GREEN);
+    visuals.widgets.active.corner_radius = CornerRadius::same(10);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, GREEN);
+    visuals.widgets.open.corner_radius = CornerRadius::same(10);
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0, GREEN);
+    visuals.selection.bg_fill = Color32::from_rgb(189, 228, 210);
+    visuals.selection.stroke = Stroke::new(1.5, GREEN);
+    visuals.error_fg_color = RED;
+    visuals.warn_fg_color = AMBER;
     context.set_visuals(visuals);
     context.all_styles_mut(|style| {
-        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        style.spacing.button_padding = egui::vec2(12.0, 8.0);
+        style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+        style.spacing.button_padding = egui::vec2(14.0, 9.0);
+        style.spacing.interact_size.y = 36.0;
+        style.spacing.combo_width = 132.0;
+        style.spacing.window_margin = Margin::same(22);
+        style.text_styles.insert(
+            egui::TextStyle::Heading,
+            FontId::new(24.0, egui::FontFamily::Proportional),
+        );
         style.text_styles.insert(
             egui::TextStyle::Body,
+            FontId::new(13.5, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Button,
             FontId::new(13.0, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Small,
+            FontId::new(11.5, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Monospace,
+            FontId::new(12.5, egui::FontFamily::Monospace),
         );
     });
 }
 
 fn section_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.heading(RichText::new(title).color(INK));
-    ui.label(RichText::new(subtitle).color(MUTED));
-    ui.add_space(16.0);
+    ui.label(RichText::new(title).size(24.0).strong().color(INK));
+    ui.label(RichText::new(subtitle).size(14.0).color(MUTED));
+    ui.add_space(18.0);
 }
 
 fn empty_state(ui: &mut egui::Ui, title: &str) {
+    let inner_width = (ui.available_width() - 64.0).max(0.0);
     Frame::new()
         .fill(SURFACE)
         .stroke(Stroke::new(1.0, LINE))
-        .corner_radius(14)
+        .corner_radius(16)
         .inner_margin(Margin::same(32))
         .show(ui, |ui| {
+            ui.set_min_width(inner_width);
             ui.vertical_centered(|ui| {
-                ui.heading(title);
+                ui.add_space(18.0);
+                ui.label(RichText::new("•").size(28.0).color(GREEN));
+                ui.label(RichText::new(title).size(18.0).strong().color(INK));
+                ui.label(
+                    RichText::new("Nothing needs your attention here right now.")
+                        .size(13.0)
+                        .color(MUTED),
+                );
+                ui.add_space(18.0);
             });
         });
 }
 
 fn field_label(ui: &mut egui::Ui, label: &str) {
-    ui.label(RichText::new(label).small().strong().color(INK));
+    ui.label(RichText::new(label).size(12.0).strong().color(INK));
+}
+
+fn singleline_field(
+    ui: &mut egui::Ui,
+    text: &mut dyn egui::TextBuffer,
+    hint: &str,
+    password: bool,
+    width: f32,
+) -> egui::Response {
+    let response = ui.add(
+        TextEdit::singleline(text)
+            .hint_text(hint)
+            .password(password)
+            .desired_width(width)
+            .min_size(egui::vec2(0.0, 40.0))
+            .frame(input_frame()),
+    );
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect,
+            10,
+            Stroke::new(1.5, GREEN),
+            egui::StrokeKind::Inside,
+        );
+    }
+    response
+}
+
+fn input_frame() -> Frame {
+    Frame::new()
+        .fill(SURFACE_MUTED)
+        .stroke(Stroke::new(1.0, LINE_STRONG))
+        .corner_radius(10)
+        .inner_margin(Margin::symmetric(12, 10))
+}
+
+fn brand_mark(ui: &mut egui::Ui) {
+    Frame::new()
+        .fill(GREEN_SOFT)
+        .corner_radius(11)
+        .inner_margin(Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            ui.label(RichText::new("S").size(17.0).strong().color(GREEN));
+        });
+}
+
+fn credential_mark(ui: &mut egui::Ui) {
+    Frame::new()
+        .fill(GREEN_SOFT)
+        .corner_radius(10)
+        .inner_margin(Margin::symmetric(9, 6))
+        .show(ui, |ui| {
+            ui.label(RichText::new("S").size(15.0).strong().color(GREEN));
+        });
+}
+
+fn status_pill(ui: &mut egui::Ui, text: &str, foreground: Color32, background: Color32) {
+    Frame::new()
+        .fill(background)
+        .corner_radius(20)
+        .inner_margin(Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 7.0;
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 3.5, foreground);
+                ui.label(RichText::new(text).size(11.0).color(foreground));
+            });
+        });
+}
+
+fn error_banner(ui: &mut egui::Ui, error: &str) {
+    let width = (ui.available_width() - 24.0).max(0.0);
+    Frame::new()
+        .fill(RED_SOFT)
+        .stroke(Stroke::new(1.0, Color32::from_rgb(244, 204, 204)))
+        .corner_radius(10)
+        .inner_margin(Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.set_min_width(width);
+            ui.label(RichText::new(error).size(12.0).color(RED));
+        });
 }
 
 fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).strong().color(Color32::WHITE))
-            .fill(INK)
-            .corner_radius(9),
+            .fill(GREEN)
+            .stroke(Stroke::NONE)
+            .corner_radius(10)
+            .min_size(egui::vec2(0.0, 38.0)),
     )
+}
+
+fn full_primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
+    let width = ui.available_width();
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.add_sized(
+            [width, 42.0],
+            egui::Button::new(RichText::new(text).strong().color(Color32::WHITE))
+                .fill(GREEN)
+                .stroke(Stroke::NONE)
+                .corner_radius(10),
+        )
+    })
+    .inner
 }
 
 fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).color(INK))
-            .fill(Color32::from_rgb(237, 240, 237))
-            .corner_radius(9),
+            .fill(SURFACE_MUTED)
+            .stroke(Stroke::new(1.0, LINE))
+            .corner_radius(10)
+            .min_size(egui::vec2(0.0, 38.0)),
     )
 }
 
 fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).color(RED))
-            .fill(Color32::from_rgb(255, 239, 239))
-            .corner_radius(9),
+            .fill(RED_SOFT)
+            .stroke(Stroke::new(1.0, Color32::from_rgb(246, 215, 215)))
+            .corner_radius(10)
+            .min_size(egui::vec2(0.0, 38.0)),
     )
 }
 
 fn nav_button(ui: &mut egui::Ui, view: &mut View, target: View, label: &str, count: usize) {
-    if ui
-        .selectable_label(*view == target, format!("{label}  {count}"))
-        .clicked()
-    {
+    let selected = *view == target;
+    let button = egui::Button::new(
+        RichText::new(format!("{label}   {count}"))
+            .strong()
+            .color(if selected { GREEN } else { MUTED }),
+    )
+    .fill(if selected {
+        GREEN_SOFT
+    } else {
+        Color32::TRANSPARENT
+    })
+    .stroke(Stroke::NONE)
+    .corner_radius(10)
+    .min_size(egui::vec2(0.0, 36.0));
+    if ui.add(button).clicked() {
         *view = target;
     }
 }
@@ -1295,5 +1533,19 @@ mod tests {
             tray_icon::MouseButton::Right,
             tray_icon::MouseButtonState::Up
         ));
+    }
+
+    #[test]
+    fn password_fields_have_a_visible_surface_and_border() {
+        let context = egui::Context::default();
+        configure_style(&context);
+        let style = context.style_of(context.theme());
+        let frame = input_frame();
+
+        assert_eq!(style.visuals.text_edit_bg_color, Some(SURFACE));
+        assert!(style.visuals.widgets.inactive.bg_stroke.width >= 1.0);
+        assert_eq!(frame.fill, SURFACE_MUTED);
+        assert!(frame.stroke.width >= 1.0);
+        assert_ne!(frame.fill, style.visuals.window_fill);
     }
 }
