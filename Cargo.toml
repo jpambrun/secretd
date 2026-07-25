@@ -1,0 +1,62 @@
+[package]
+name = "secretd"
+version = "0.1.0"
+edition = "2024"
+description = "A native local secret vault with per-request approval"
+license = "MIT"
+default-run = "secretd-desktop"
+
+[lib]
+name = "secretd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "secretd"
+path = "src/bin/secretd.rs"
+
+[[bin]]
+name = "secretd-desktop"
+path = "src/bin/secretd-desktop.rs"
+
+[dependencies]
+aes-gcm = "0.10"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+egui = { version = "0.35", default-features = false, features = ["default_fonts"] }
+egui-winit = { version = "0.35", default-features = false, features = [
+    "accesskit",
+    "clipboard",
+    "links",
+    "wayland",
+    "x11",
+] }
+egui_glow = { version = "0.35", default-features = false, features = [
+    "wayland",
+    "winit",
+    "x11",
+] }
+getrandom = "0.3"
+glow = "0.17"
+glutin = "0.32"
+glutin-winit = "0.5"
+pbkdf2 = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tray-icon = "0.24"
+uuid = { version = "1", features = ["v4"] }
+winit = { version = "0.30", default-features = false }
+zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
+panic = "abort"
