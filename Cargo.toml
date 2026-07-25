@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A native local secret vault with per-request approval"
 license = "MIT"
-default-run = "secretd-desktop"
+default-run = "secretd"
 
 [lib]
 name = "secretd"
@@ -13,10 +13,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "secretd"
 path = "src/bin/secretd.rs"
-
-[[bin]]
-name = "secretd-desktop"
-path = "src/bin/secretd-desktop.rs"
 
 [dependencies]
 aes-gcm = "0.10"

@@ -12,10 +12,10 @@ check:
     cargo test
 
 run:
-    cargo run --release --bin secretd-desktop
+    cargo run --release --bin secretd
 
 build:
-    cargo build --release --bins
+    cargo build --release --bin secretd
 
 package-macos:
     sh scripts/package-macos.sh

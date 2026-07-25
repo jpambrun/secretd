@@ -6,7 +6,7 @@
   <key>CFBundleDisplayName</key>
   <string>SecretD</string>
   <key>CFBundleExecutable</key>
-  <string>secretd-desktop</string>
+  <string>secretd</string>
   <key>CFBundleIdentifier</key>
   <string>dev.jpambrun.secretd</string>
   <key>CFBundleInfoDictionaryVersion</key>

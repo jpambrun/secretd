@@ -1,7 +1,7 @@
 # SecretD (Rust)
 
-SecretD is a native local secret vault. It keeps an encrypted vault on disk, runs in the system
-tray, and asks for approval before the `secretd` CLI can release a secret to another process.
+SecretD is a native local secret vault distributed as one executable. With no arguments it runs in
+the system tray; its `get` command asks the desktop process for approval before releasing a secret.
 
 This implementation is file- and protocol-compatible with the Deno implementation in
 `../secretd`.
@@ -16,10 +16,13 @@ just run
 In another terminal:
 
 ```sh
-cargo run --bin secretd -- get service/account/token
+target/release/secretd get service/account/token
 ```
 
-On macOS, build `dist/SecretD.app` and `dist/bin/secretd` with:
+Use `secretd --show` to launch the tray service with its window open.
+
+On macOS, package the same executable as both `dist/SecretD.app/Contents/MacOS/secretd` and the
+standalone `dist/bin/secretd` with:
 
 ```sh
 just package-macos
