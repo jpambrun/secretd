@@ -1,4 +1,10 @@
+use std::io::Cursor;
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use png::{BitDepth, ColorType, Decoder, Transformations};
 use tray_icon::Icon;
+
+const TRAY_ICON_PNG: &str = include_str!("../assets/tray-light.png.base64");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayStatus {
@@ -7,34 +13,45 @@ pub enum TrayStatus {
     Pending,
 }
 
-pub fn tray_icon(status: TrayStatus) -> Result<Icon, String> {
-    let color = match status {
-        TrayStatus::Locked => [126, 135, 130, 255],
-        TrayStatus::Unlocked => [22, 155, 99, 255],
-        TrayStatus::Pending => [216, 145, 34, 255],
-    };
-    const SIZE: u32 = 32;
-    let mut rgba = vec![0; (SIZE * SIZE * 4) as usize];
-    for y in 6_i32..28 {
-        for x in 5_i32..27 {
-            let dx = x - 16;
-            let in_top = y < 17 && dx * dx + (y - 14) * (y - 14) <= 10 * 10;
-            let in_body = (13..=25).contains(&y) && (7..=25).contains(&x);
-            if !(in_top || in_body) {
-                continue;
-            }
-            if (12..=20).contains(&x) && (10..=19).contains(&y) {
-                continue;
-            }
-            let index = ((y as u32 * SIZE + x as u32) * 4) as usize;
-            rgba[index..index + 4].copy_from_slice(&color);
-        }
+pub fn tray_icon(_status: TrayStatus) -> Result<Icon, String> {
+    let (rgba, width, height) = decode_tray_icon()?;
+    Icon::from_rgba(rgba, width, height).map_err(|error| error.to_string())
+}
+
+fn decode_tray_icon() -> Result<(Vec<u8>, u32, u32), String> {
+    let encoded = STANDARD
+        .decode(TRAY_ICON_PNG.trim())
+        .map_err(|error| format!("invalid embedded tray icon: {error}"))?;
+    let mut decoder = Decoder::new(Cursor::new(encoded));
+    decoder.set_transformations(Transformations::EXPAND | Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| format!("could not read embedded tray icon: {error}"))?;
+    let mut rgba = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .ok_or("embedded tray icon is too large")?
+    ];
+    let info = reader
+        .next_frame(&mut rgba)
+        .map_err(|error| format!("could not decode embedded tray icon: {error}"))?;
+    if info.color_type != ColorType::Rgba || info.bit_depth != BitDepth::Eight {
+        return Err("embedded tray icon must be an 8-bit RGBA PNG".to_owned());
     }
-    for y in 16_i32..23 {
-        for x in 14_i32..18 {
-            let index = ((y as u32 * SIZE + x as u32) * 4) as usize;
-            rgba[index..index + 4].copy_from_slice(&color);
-        }
+    rgba.truncate(info.buffer_size());
+    Ok((rgba, info.width, info.height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_tray_icon;
+
+    #[test]
+    fn embeds_the_original_typescript_tray_icon() {
+        let (rgba, width, height) = decode_tray_icon().expect("tray icon should decode");
+
+        assert_eq!((width, height), (44, 44));
+        assert_eq!(rgba.len(), 44 * 44 * 4);
     }
-    Icon::from_rgba(rgba, SIZE, SIZE).map_err(|error| error.to_string())
 }

@@ -124,6 +124,7 @@ impl SecretDApp {
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(tray_menu.clone()))
             .with_icon(tray_icon(tray_status).map_err(std::io::Error::other)?)
+            .with_icon_as_template(true)
             .with_tooltip("SecretD")
             .with_menu_on_left_click(false)
             .build()?;

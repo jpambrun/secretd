@@ -3072,6 +3072,7 @@ dependencies = [
  "glutin-winit",
  "libc",
  "pbkdf2",
+ "png",
  "serde",
  "serde_json",
  "sha2",
