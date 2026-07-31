@@ -76,7 +76,6 @@ struct Toast {
 
 #[derive(Clone, Copy)]
 struct RequestChoice {
-    scope: GrantScope,
     seconds: u64,
 }
 
@@ -694,10 +693,7 @@ impl SecretDApp {
         for request in &snapshot.pending {
             self.request_choices
                 .entry(request.id.clone())
-                .or_insert(RequestChoice {
-                    scope: GrantScope::Secret,
-                    seconds: 300,
-                });
+                .or_insert(RequestChoice { seconds: 300 });
             Frame::new()
                 .fill(SURFACE)
                 .stroke(Stroke::new(
@@ -727,7 +723,7 @@ impl SecretDApp {
                         }
                     });
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if danger_button(ui, "Deny").clicked() {
                             response = Some((
                                 request.id.clone(),
@@ -746,25 +742,6 @@ impl SecretDApp {
                         }
                         if request.verified {
                             let choice = self.request_choices.get_mut(&request.id).unwrap();
-                            egui::ComboBox::from_id_salt(format!("scope-{}", request.id))
-                                .selected_text(match choice.scope {
-                                    GrantScope::Secret => "Only this secret",
-                                    GrantScope::Group => "Entire group",
-                                })
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut choice.scope,
-                                        GrantScope::Secret,
-                                        "Only this secret",
-                                    );
-                                    if request.group.is_some() {
-                                        ui.selectable_value(
-                                            &mut choice.scope,
-                                            GrantScope::Group,
-                                            "Entire group",
-                                        );
-                                    }
-                                });
                             egui::ComboBox::from_id_salt(format!("ttl-{}", request.id))
                                 .selected_text(duration_label(choice.seconds))
                                 .show_ui(ui, |ui| {
@@ -776,13 +753,24 @@ impl SecretDApp {
                                         );
                                     }
                                 });
-                            if primary_button(ui, "Grant access").clicked() {
+                            if primary_button(ui, "Grant this secret").clicked() {
                                 response = Some((
                                     request.id.clone(),
                                     ApprovalDecision::Temporary,
                                     Some(choice.seconds),
-                                    choice.scope,
+                                    GrantScope::Secret,
                                 ));
+                            }
+                            if let Some(group) = &request.group {
+                                let label = group_grant_label(group);
+                                if primary_button(ui, &label).clicked() {
+                                    response = Some((
+                                        request.id.clone(),
+                                        ApprovalDecision::Temporary,
+                                        Some(choice.seconds),
+                                        GrantScope::Group,
+                                    ));
+                                }
                             }
                         }
                     });
@@ -1428,6 +1416,10 @@ fn duration_label(seconds: u64) -> &'static str {
     }
 }
 
+fn group_grant_label(group: &str) -> String {
+    format!("Grant entire {group} group")
+}
+
 fn duration_until(timestamp: u64) -> String {
     let seconds = timestamp
         .saturating_sub(secretd::grants::now_millis())
@@ -1547,5 +1539,10 @@ mod tests {
         assert_eq!(frame.fill, SURFACE_MUTED);
         assert!(frame.stroke.width >= 1.0);
         assert_ne!(frame.fill, style.visuals.window_fill);
+    }
+
+    #[test]
+    fn group_grant_button_names_the_group() {
+        assert_eq!(group_grant_label("aws-to"), "Grant entire aws-to group");
     }
 }

@@ -19,7 +19,9 @@ In another terminal:
 target/release/secretd get service/account/token
 ```
 
-Use `secretd --show` to launch the tray service with its window open.
+Use `secretd --show` to launch the tray service with its window open. Desktop launches detach from
+the invoking terminal; use `secretd desktop --foreground` when attached logs are useful for
+development or diagnostics.
 
 On macOS, package the same executable as both `dist/SecretD.app/Contents/MacOS/secretd` and the
 standalone `dist/bin/secretd` with:

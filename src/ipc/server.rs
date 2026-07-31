@@ -17,7 +17,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    controller::{ApprovalDecision, Controller, RequestOutcome},
+    controller::{Controller, RequestOutcome, RequestResolution},
     paths::ensure_parent,
     process::{inspect_process_tree, verify_connection_owner},
 };
@@ -167,7 +167,7 @@ fn handle_connection(
             RequestOutcome::Pending { id, receiver } => {
                 notify();
                 match receiver.recv_timeout(REQUEST_TIMEOUT) {
-                    Ok(ApprovalDecision::Once | ApprovalDecision::Temporary) => {
+                    Ok(RequestResolution::Approved) => {
                         let value = controller
                             .lock()
                             .map_err(|_| "SecretD state is unavailable".to_string())?
@@ -176,9 +176,13 @@ fn handle_connection(
                         notify();
                         value
                     }
-                    Ok(ApprovalDecision::Deny) => {
+                    Ok(RequestResolution::Denied) => {
                         notify();
                         Err("Request denied or timed out".into())
+                    }
+                    Ok(RequestResolution::Failed(error)) => {
+                        notify();
+                        Err(error)
                     }
                     Err(_) => {
                         if let Ok(mut controller) = controller.lock() {

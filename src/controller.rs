@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
 };
@@ -18,6 +18,13 @@ pub enum ApprovalDecision {
     Deny,
     Once,
     Temporary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestResolution {
+    Approved,
+    Denied,
+    Failed(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,7 +76,7 @@ pub enum RequestOutcome {
     Immediate(Zeroizing<String>),
     Pending {
         id: String,
-        receiver: Receiver<ApprovalDecision>,
+        receiver: Receiver<RequestResolution>,
     },
 }
 
@@ -77,7 +84,8 @@ pub struct Controller {
     vault: VaultStore,
     grants: GrantStore,
     pending: HashMap<String, PendingRequest>,
-    pending_decisions: HashMap<String, Sender<ApprovalDecision>>,
+    pending_resolutions: HashMap<String, Sender<RequestResolution>>,
+    waiting_for_unlock: HashSet<String>,
     audit: Vec<AuditEntry>,
 }
 
@@ -87,7 +95,8 @@ impl Controller {
             vault: VaultStore::new(vault_path),
             grants: GrantStore::default(),
             pending: HashMap::new(),
-            pending_decisions: HashMap::new(),
+            pending_resolutions: HashMap::new(),
+            waiting_for_unlock: HashSet::new(),
             audit: Vec::new(),
         }
     }
@@ -116,11 +125,15 @@ impl Controller {
     }
 
     pub fn create_vault(&mut self, password: &str) -> Result<(), VaultError> {
-        self.vault.create(password)
+        self.vault.create(password)?;
+        self.prepare_waiting_requests();
+        Ok(())
     }
 
     pub fn unlock(&mut self, password: &str) -> Result<(), VaultError> {
-        self.vault.unlock(password)
+        self.vault.unlock(password)?;
+        self.prepare_waiting_requests();
+        Ok(())
     }
 
     pub fn lock(&mut self) {
@@ -195,18 +208,18 @@ impl Controller {
         process_tree: Vec<ProcessIdentity>,
         verified: bool,
     ) -> Result<RequestOutcome, VaultError> {
-        if !self.vault.unlocked() {
-            return Err(VaultError("Vault is locked".into()));
-        }
         let secret = normalize_secret_name(secret_input)?;
-        drop(self.vault.reveal(&secret)?);
-        let group = self.vault.group(&secret)?;
         let process_tree = omit_secretd_client_processes(&process_tree);
         let Some(origin) = process_tree.first().cloned() else {
             return Err(VaultError(
                 "Unable to determine the requesting process".into(),
             ));
         };
+        if !self.vault.unlocked() {
+            return Ok(self.queue_request(secret, None, process_tree, origin, verified, true));
+        }
+        drop(self.vault.reveal(&secret)?);
+        let group = self.vault.group(&secret)?;
         if verified && let Some(grant) = self.grants.find(&secret, group.as_deref(), &origin) {
             self.record_audit(AuditEntry {
                 id: String::new(),
@@ -221,6 +234,18 @@ impl Controller {
             });
             return Ok(RequestOutcome::Immediate(self.vault.reveal(&secret)?));
         }
+        Ok(self.queue_request(secret, group, process_tree, origin, verified, false))
+    }
+
+    fn queue_request(
+        &mut self,
+        secret: String,
+        group: Option<String>,
+        process_tree: Vec<ProcessIdentity>,
+        origin: ProcessIdentity,
+        verified: bool,
+        waiting_for_unlock: bool,
+    ) -> RequestOutcome {
         let id = Uuid::new_v4().to_string();
         let request = PendingRequest {
             id: id.clone(),
@@ -233,8 +258,37 @@ impl Controller {
         };
         let (sender, receiver) = mpsc::channel();
         self.pending.insert(id.clone(), request);
-        self.pending_decisions.insert(id.clone(), sender);
-        Ok(RequestOutcome::Pending { id, receiver })
+        self.pending_resolutions.insert(id.clone(), sender);
+        if waiting_for_unlock {
+            self.waiting_for_unlock.insert(id.clone());
+        }
+        RequestOutcome::Pending { id, receiver }
+    }
+
+    fn prepare_waiting_requests(&mut self) {
+        let waiting: Vec<_> = self.waiting_for_unlock.drain().collect();
+        for id in waiting {
+            let Some(request) = self.pending.get(&id).cloned() else {
+                continue;
+            };
+            let prepared = (|| {
+                drop(self.vault.reveal(&request.secret)?);
+                self.vault.group(&request.secret)
+            })();
+            match prepared {
+                Ok(group) => {
+                    if let Some(request) = self.pending.get_mut(&id) {
+                        request.group = group;
+                    }
+                }
+                Err(error) => {
+                    self.pending.remove(&id);
+                    if let Some(sender) = self.pending_resolutions.remove(&id) {
+                        let _ = sender.send(RequestResolution::Failed(error.to_string()));
+                    }
+                }
+            }
+        }
     }
 
     pub fn respond(
@@ -249,6 +303,9 @@ impl Controller {
             .get(id)
             .cloned()
             .ok_or_else(|| VaultError("Request is no longer pending".into()))?;
+        if self.waiting_for_unlock.contains(id) && decision != ApprovalDecision::Deny {
+            return Err(VaultError("Vault is locked".into()));
+        }
         if decision != ApprovalDecision::Temporary {
             scope = GrantScope::Secret;
         }
@@ -291,8 +348,14 @@ impl Controller {
             process: request.origin,
         });
         self.pending.remove(id);
-        if let Some(sender) = self.pending_decisions.remove(id) {
-            let _ = sender.send(decision);
+        self.waiting_for_unlock.remove(id);
+        if let Some(sender) = self.pending_resolutions.remove(id) {
+            let resolution = if decision == ApprovalDecision::Deny {
+                RequestResolution::Denied
+            } else {
+                RequestResolution::Approved
+            };
+            let _ = sender.send(resolution);
         }
         Ok(())
     }
@@ -301,7 +364,8 @@ impl Controller {
         let Some(request) = self.pending.remove(id) else {
             return;
         };
-        self.pending_decisions.remove(id);
+        self.pending_resolutions.remove(id);
+        self.waiting_for_unlock.remove(id);
         self.record_audit(AuditEntry {
             id: String::new(),
             occurred_at: 0,
@@ -387,7 +451,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
-            ApprovalDecision::Temporary
+            RequestResolution::Approved
         );
         let reused = controller
             .begin_request("aws/secret-key", vec![origin], true)
@@ -400,5 +464,63 @@ mod tests {
             controller.snapshot().audit[0].action,
             AuditAction::AutoGranted
         );
+    }
+
+    #[test]
+    fn locked_request_waits_for_unlock_and_then_requires_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(directory.path().join("vault.json"));
+        controller.create_vault("correct horse").unwrap();
+        controller
+            .save_secret("qwer", "correct password", None, Some("ro"))
+            .unwrap();
+        controller.lock();
+
+        let outcome = controller
+            .begin_request("qwer", vec![process(20, "/usr/local/bin/tool")], true)
+            .unwrap();
+        let RequestOutcome::Pending { id, receiver } = outcome else {
+            panic!("locked request should wait for unlock");
+        };
+        assert_eq!(controller.snapshot().pending.len(), 1);
+
+        controller.unlock("correct horse").unwrap();
+        assert_eq!(
+            controller.snapshot().pending[0].group.as_deref(),
+            Some("ro")
+        );
+        controller
+            .respond(&id, ApprovalDecision::Once, None, GrantScope::Secret)
+            .unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RequestResolution::Approved
+        );
+        assert_eq!(
+            &*controller.release_after_approval("qwer").unwrap(),
+            "correct password"
+        );
+    }
+
+    #[test]
+    fn locked_request_reports_validation_error_after_unlock() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(directory.path().join("vault.json"));
+        controller.create_vault("correct horse").unwrap();
+        controller.lock();
+
+        let outcome = controller
+            .begin_request("missing", vec![process(20, "/usr/local/bin/tool")], true)
+            .unwrap();
+        let RequestOutcome::Pending { receiver, .. } = outcome else {
+            panic!("locked request should wait for unlock");
+        };
+
+        controller.unlock("correct horse").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RequestResolution::Failed("Secret not found".into())
+        );
+        assert!(controller.snapshot().pending.is_empty());
     }
 }
