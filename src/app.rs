@@ -25,6 +25,7 @@ use secretd::{
     grants::GrantScope,
     ipc::{RequestServer, begin_aws_login},
     paths::{default_runtime_path, default_vault_path},
+    process::{ProcessIdentity, is_launchd_process, same_process},
 };
 
 use crate::icon::{TrayStatus, tray_icon};
@@ -135,6 +136,7 @@ pub struct SecretDApp {
     revealed: Option<(String, Zeroizing<String>)>,
     delete_confirmation: Option<String>,
     request_choices: HashMap<String, RequestChoice>,
+    grant_process_choices: HashMap<String, ProcessIdentity>,
     request_error: Option<String>,
     toast: Option<Toast>,
 }
@@ -216,6 +218,7 @@ impl SecretDApp {
             revealed: None,
             delete_confirmation: None,
             request_choices: HashMap::new(),
+            grant_process_choices: HashMap::new(),
             request_error: None,
             toast: None,
         })
@@ -406,18 +409,16 @@ impl SecretDApp {
                                 .size(11.0)
                                 .color(MUTED),
                             );
-                            let mut confirmation_focused = false;
                             if creating {
                                 ui.add_space(8.0);
                                 field_label(ui, "Confirm password");
-                                let confirmation = singleline_field(
+                                singleline_field(
                                     ui,
                                     &mut *self.auth_confirmation,
                                     "Enter it again",
                                     true,
                                     f32::INFINITY,
                                 );
-                                confirmation_focused = confirmation.has_focus();
                             }
                             if let Some(error) = &self.auth_error {
                                 ui.add_space(4.0);
@@ -426,7 +427,7 @@ impl SecretDApp {
                             ui.add_space(12.0);
                             let ready = !self.auth_password.is_empty()
                                 && (!creating || !self.auth_confirmation.is_empty());
-                            let submit = full_primary_button(
+                            let submit_clicked = full_primary_button(
                                 ui,
                                 if creating {
                                     "Create encrypted vault"
@@ -435,11 +436,8 @@ impl SecretDApp {
                                 },
                                 ready,
                             )
-                            .clicked()
-                                || (enter
-                                    && ready
-                                    && (password.has_focus() || confirmation_focused));
-                            if submit {
+                            .clicked();
+                            if auth_submission_requested(submit_clicked, enter, ready) {
                                 self.submit_auth(creating);
                             }
                             ui.add_space(6.0);
@@ -482,6 +480,7 @@ impl SecretDApp {
                 self.auth_password.zeroize();
                 self.auth_confirmation.zeroize();
                 self.refresh_state();
+                (self.notify)();
             }
             Err(error) => self.auth_error = Some(error),
         }
@@ -1021,6 +1020,11 @@ impl SecretDApp {
                                 .pending_aws
                                 .first()
                                 .expect("AWS request was selected");
+                            let mut grant_process = self
+                                .grant_process_choices
+                                .get(&request.id)
+                                .cloned()
+                                .or_else(|| default_grant_process(&request.process_tree));
                             Frame::new()
                                 .fill(SURFACE)
                                 .stroke(Stroke::new(
@@ -1031,30 +1035,17 @@ impl SecretDApp {
                                 .inner_margin(Margin::same(18))
                                 .show(ui, |ui| {
                                     aws_request_heading(ui, request);
-                                    ui.add_space(8.0);
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{} · PID {}",
-                                            request.origin.executable, request.origin.pid
-                                        ))
-                                        .color(MUTED),
+                                    ui.add_space(12.0);
+                                    process_grant_selector(
+                                        ui,
+                                        &request.process_tree,
+                                        &mut grant_process,
+                                        request.verified,
                                     );
-                                    egui::CollapsingHeader::new("Process tree").show(ui, |ui| {
-                                        for (index, process) in
-                                            request.process_tree.iter().enumerate()
-                                        {
-                                            ui.monospace(format!(
-                                                "{}{} [{}]",
-                                                "  ".repeat(index),
-                                                process.command,
-                                                process.pid
-                                            ));
-                                        }
-                                    });
                                     ui.add_space(8.0);
                                     ui.horizontal_wrapped(|ui| {
                                         if danger_button(ui, "Deny").clicked() {
-                                            aws_response = Some((request.id.clone(), None));
+                                            aws_response = Some((request.id.clone(), None, None));
                                         }
                                         if snapshot.unlocked {
                                             if secondary_button(ui, "Grant read-only credentials")
@@ -1063,6 +1054,7 @@ impl SecretDApp {
                                                 aws_response = Some((
                                                     request.id.clone(),
                                                     Some(AwsAccessLevel::ReadOnly),
+                                                    grant_process.clone(),
                                                 ));
                                             }
                                             if admin_button(ui, "Grant admin credentials").clicked()
@@ -1070,6 +1062,7 @@ impl SecretDApp {
                                                 aws_response = Some((
                                                     request.id.clone(),
                                                     Some(AwsAccessLevel::Admin),
+                                                    grant_process.clone(),
                                                 ));
                                             }
                                         } else if primary_button(ui, "Open SecretD to unlock")
@@ -1079,6 +1072,10 @@ impl SecretDApp {
                                         }
                                     });
                                 });
+                            if let Some(grant_process) = grant_process {
+                                self.grant_process_choices
+                                    .insert(request.id.clone(), grant_process);
+                            }
                         } else {
                             let request = snapshot
                                 .pending
@@ -1087,6 +1084,11 @@ impl SecretDApp {
                             self.request_choices
                                 .entry(request.id.clone())
                                 .or_insert(RequestChoice { seconds: 300 });
+                            let mut grant_process = self
+                                .grant_process_choices
+                                .get(&request.id)
+                                .cloned()
+                                .or_else(|| default_grant_process(&request.process_tree));
                             Frame::new()
                                 .fill(SURFACE)
                                 .stroke(Stroke::new(
@@ -1097,26 +1099,13 @@ impl SecretDApp {
                                 .inner_margin(Margin::same(18))
                                 .show(ui, |ui| {
                                     request_heading(ui, request);
-                                    ui.add_space(8.0);
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{} · PID {}",
-                                            request.origin.executable, request.origin.pid
-                                        ))
-                                        .color(MUTED),
+                                    ui.add_space(12.0);
+                                    process_grant_selector(
+                                        ui,
+                                        &request.process_tree,
+                                        &mut grant_process,
+                                        request.verified,
                                     );
-                                    egui::CollapsingHeader::new("Process tree").show(ui, |ui| {
-                                        for (index, process) in
-                                            request.process_tree.iter().enumerate()
-                                        {
-                                            ui.monospace(format!(
-                                                "{}{} [{}]",
-                                                "  ".repeat(index),
-                                                process.command,
-                                                process.pid
-                                            ));
-                                        }
-                                    });
                                     ui.add_space(8.0);
                                     ui.horizontal_wrapped(|ui| {
                                         if danger_button(ui, "Deny").clicked() {
@@ -1125,6 +1114,7 @@ impl SecretDApp {
                                                 ApprovalDecision::Deny,
                                                 None,
                                                 GrantScope::Secret,
+                                                None,
                                             ));
                                         }
                                         if snapshot.unlocked
@@ -1135,6 +1125,7 @@ impl SecretDApp {
                                                 ApprovalDecision::Once,
                                                 None,
                                                 GrantScope::Secret,
+                                                None,
                                             ));
                                         }
                                         if snapshot.unlocked && request.verified {
@@ -1163,6 +1154,7 @@ impl SecretDApp {
                                                     ApprovalDecision::Temporary,
                                                     Some(choice.seconds),
                                                     GrantScope::Secret,
+                                                    grant_process.clone(),
                                                 ));
                                             }
                                             if let Some(group) = &request.group {
@@ -1173,6 +1165,7 @@ impl SecretDApp {
                                                         ApprovalDecision::Temporary,
                                                         Some(choice.seconds),
                                                         GrantScope::Group,
+                                                        grant_process.clone(),
                                                     ));
                                                 }
                                             }
@@ -1184,17 +1177,21 @@ impl SecretDApp {
                                         }
                                     });
                                 });
+                            if let Some(grant_process) = grant_process {
+                                self.grant_process_choices
+                                    .insert(request.id.clone(), grant_process);
+                            }
                         }
                     });
             });
-        if let Some((id, decision, seconds, scope)) = response {
+        if let Some((id, decision, seconds, scope, grant_process)) = response {
             let result = self
                 .controller
                 .lock()
                 .map_err(|_| "SecretD state is unavailable".to_string())
                 .and_then(|mut controller| {
                     controller
-                        .respond(&id, decision, seconds, scope)
+                        .respond(&id, decision, seconds, scope, grant_process)
                         .map_err(|error| error.to_string())
                 });
             match result {
@@ -1205,16 +1202,17 @@ impl SecretDApp {
                 Err(error) => self.request_error = Some(error),
             }
             self.request_choices.remove(&id);
+            self.grant_process_choices.remove(&id);
             self.refresh_state();
         }
-        if let Some((id, level)) = aws_response {
+        if let Some((id, level, grant_process)) = aws_response {
             let result = self
                 .controller
                 .lock()
                 .map_err(|_| "SecretD state is unavailable".to_string())
                 .and_then(|mut controller| {
                     controller
-                        .respond_aws(&id, level)
+                        .respond_aws(&id, level, grant_process)
                         .map_err(|error| error.to_string())
                 });
             match result {
@@ -1224,6 +1222,7 @@ impl SecretDApp {
                 }
                 Err(error) => self.request_error = Some(error),
             }
+            self.grant_process_choices.remove(&id);
             self.refresh_state();
         }
         action
@@ -1240,7 +1239,8 @@ impl SecretDApp {
             if let Some(request) = snapshot.pending_aws.first()
                 && let Ok(mut controller) = self.controller.lock()
             {
-                let _ = controller.respond_aws(&request.id, None);
+                let _ = controller.respond_aws(&request.id, None, None);
+                self.grant_process_choices.remove(&request.id);
             }
         } else if let Some(request) = snapshot.pending.first()
             && let Ok(mut controller) = self.controller.lock()
@@ -1250,8 +1250,10 @@ impl SecretDApp {
                 ApprovalDecision::Deny,
                 None,
                 GrantScope::Secret,
+                None,
             );
             self.request_choices.remove(&request.id);
+            self.grant_process_choices.remove(&request.id);
         }
         self.request_error = None;
         self.refresh_state();
@@ -1261,7 +1263,7 @@ impl SecretDApp {
         section_header(
             ui,
             "Active access",
-            "AWS grants follow the requesting process. All grants disappear when SecretD exits or the vault locks.",
+            "Grants follow the selected process and its children. All grants disappear when SecretD exits or the vault locks.",
         );
         if snapshot.grants.is_empty() && snapshot.aws_grants.is_empty() {
             empty_state(ui, "No active grants");
@@ -1291,7 +1293,7 @@ impl SecretDApp {
                             );
                             ui.label(
                                 RichText::new(format!(
-                                    "{} · PID {} · active for this process",
+                                    "{} · PID {} · active for this process and its children",
                                     grant.process.executable, grant.process.pid
                                 ))
                                 .small()
@@ -1816,6 +1818,8 @@ impl SecretDApp {
         self.revealed = None;
         self.form_error = None;
         self.request_error = None;
+        self.request_choices.clear();
+        self.grant_process_choices.clear();
         self.auth_focus_requested = false;
     }
 }
@@ -1909,6 +1913,10 @@ fn empty_state(ui: &mut egui::Ui, title: &str) {
 
 fn field_label(ui: &mut egui::Ui, label: &str) {
     ui.label(RichText::new(label).size(12.0).strong().color(INK));
+}
+
+fn auth_submission_requested(button_clicked: bool, enter_pressed: bool, ready: bool) -> bool {
+    button_clicked || (enter_pressed && ready)
 }
 
 fn singleline_field(
@@ -2064,6 +2072,113 @@ fn nav_button(ui: &mut egui::Ui, view: &mut View, target: View, label: &str, cou
     .min_size(egui::vec2(0.0, 36.0));
     if ui.add(button).clicked() {
         *view = target;
+    }
+}
+
+fn default_grant_process(process_tree: &[ProcessIdentity]) -> Option<ProcessIdentity> {
+    process_tree
+        .iter()
+        .find(|process| !is_launchd_process(process))
+        .cloned()
+}
+
+fn grantable_processes(process_tree: &[ProcessIdentity]) -> Vec<&ProcessIdentity> {
+    process_tree
+        .iter()
+        .filter(|process| !is_launchd_process(process))
+        .rev()
+        .collect()
+}
+
+fn process_grant_selector(
+    ui: &mut egui::Ui,
+    process_tree: &[ProcessIdentity],
+    selected: &mut Option<ProcessIdentity>,
+    verified: bool,
+) {
+    ui.label(
+        RichText::new(if verified {
+            "Grant boundary"
+        } else {
+            "Requesting process"
+        })
+        .size(13.0)
+        .strong()
+        .color(INK),
+    );
+    ui.label(
+        RichText::new(if verified {
+            "Choose which process and its children may reuse this access."
+        } else {
+            "The process chain is informational because this request can only be allowed once."
+        })
+        .size(11.0)
+        .color(MUTED),
+    );
+    ui.add_space(6.0);
+
+    let requester = process_tree
+        .iter()
+        .find(|process| !is_launchd_process(process));
+    Frame::new()
+        .fill(SURFACE_MUTED)
+        .stroke(Stroke::new(1.0, LINE))
+        .corner_radius(10)
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().interact_size.y = 28.0;
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.spacing_mut().button_padding.y = 4.0;
+            for (depth, process) in grantable_processes(process_tree).into_iter().enumerate() {
+                let is_selected = selected
+                    .as_ref()
+                    .is_some_and(|current| same_process(current, process));
+                ui.horizontal(|ui| {
+                    ui.add_space(depth as f32 * 18.0);
+                    if depth > 0 {
+                        ui.label(RichText::new("└─").monospace().color(LINE_STRONG));
+                    }
+                    let label = if process.command.trim().is_empty() {
+                        process.executable.as_str()
+                    } else {
+                        process.command.as_str()
+                    };
+                    let radio = ui
+                        .add_enabled_ui(verified, |ui| {
+                            ui.radio(is_selected, RichText::new(label).monospace().color(INK))
+                        })
+                        .inner;
+                    if radio.clicked() {
+                        *selected = Some(process.clone());
+                    }
+                    ui.label(
+                        RichText::new(format!("PID {}", process.pid))
+                            .small()
+                            .color(MUTED),
+                    );
+                    if requester.is_some_and(|requester| same_process(requester, process)) {
+                        ui.label(RichText::new("requester").small().color(GREEN));
+                    }
+                });
+            }
+        });
+
+    if verified && let Some(selected) = selected {
+        let name = selected
+            .executable
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&selected.executable);
+        ui.add_space(5.0);
+        ui.label(
+            RichText::new(format!(
+                "Access will follow {name} and its child processes."
+            ))
+            .size(11.0)
+            .color(GREEN),
+        );
     }
 }
 
@@ -2444,6 +2559,13 @@ mod tests {
     }
 
     #[test]
+    fn enter_submits_a_complete_auth_form_without_requiring_focus_state() {
+        assert!(auth_submission_requested(false, true, true));
+        assert!(!auth_submission_requested(false, true, false));
+        assert!(auth_submission_requested(true, false, true));
+    }
+
+    #[test]
     fn group_grant_button_names_the_group() {
         assert_eq!(group_grant_label("aws-to"), "Grant entire aws-to group");
     }
@@ -2479,5 +2601,24 @@ mod tests {
         assert_eq!(finite_combo_width(f32::INFINITY, 100.0), 120.0);
         assert_eq!(finite_combo_width(f32::NAN, 160.0), 160.0);
         assert_eq!(finite_combo_width(240.0, 100.0), 240.0);
+    }
+
+    #[test]
+    fn grantable_process_tree_is_ancestor_first_and_omits_launchd() {
+        let process = |pid, executable: &str| ProcessIdentity {
+            pid,
+            ppid: pid.saturating_sub(1),
+            started_at: format!("start-{pid}"),
+            executable: executable.into(),
+            command: executable.into(),
+        };
+        let child = process(30, "/usr/bin/terraform");
+        let shell = process(20, "/bin/zsh");
+        let launchd = process(1, "/sbin/launchd");
+        let tree = [child.clone(), shell.clone(), launchd];
+
+        let grantable = grantable_processes(&tree);
+        assert_eq!(grantable, [&shell, &child]);
+        assert_eq!(default_grant_process(&tree), Some(child));
     }
 }

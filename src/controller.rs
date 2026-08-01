@@ -13,7 +13,10 @@ use crate::{
         AwsSettingsSummary, validate_aws_profile,
     },
     grants::{Grant, GrantScope, GrantStore, MAX_GRANT_SECONDS, now_millis},
-    process::{ProcessIdentity, omit_secretd_client_processes, process_is_alive},
+    process::{
+        ProcessIdentity, is_launchd_process, omit_secretd_client_processes, process_is_alive,
+        same_process,
+    },
     vault::{SecretSummary, VaultError, VaultStore, normalize_secret_name},
 };
 
@@ -211,7 +214,7 @@ impl Controller {
         }
         let pending: Vec<_> = self.pending.keys().cloned().collect();
         for id in pending {
-            let _ = self.respond(&id, ApprovalDecision::Deny, None, GrantScope::Secret);
+            let _ = self.respond(&id, ApprovalDecision::Deny, None, GrantScope::Secret, None);
         }
         for sender in self
             .pending_aws_resolutions
@@ -366,9 +369,10 @@ impl Controller {
                 .target(&profile)
                 .map_err(VaultError)?;
             if verified
-                && let Some(decision) = self.aws_process_decisions.iter().find(|decision| {
-                    decision.profile == profile
-                        && crate::process::same_process(&decision.process, &origin)
+                && let Some(decision) = process_tree.iter().find_map(|process| {
+                    self.aws_process_decisions.iter().rev().find(|decision| {
+                        decision.profile == profile && same_process(&decision.process, process)
+                    })
                 })
             {
                 return Ok(AwsRequestOutcome::Immediate(decision.level));
@@ -393,6 +397,7 @@ impl Controller {
         &mut self,
         id: &str,
         level: Option<AwsAccessLevel>,
+        grant_process: Option<ProcessIdentity>,
     ) -> Result<(), VaultError> {
         let request = self
             .pending_aws
@@ -409,15 +414,17 @@ impl Controller {
                 .target(&request.profile)
                 .map_err(VaultError)?;
             if request.verified {
+                let grant_process =
+                    validated_grant_process(&request.process_tree, &request.origin, grant_process)?;
                 self.aws_process_decisions.retain(|decision| {
                     decision.profile != request.profile
-                        || !crate::process::same_process(&decision.process, &request.origin)
+                        || !same_process(&decision.process, &grant_process)
                 });
                 self.aws_process_decisions.push(AwsCredentialGrant {
                     id: Uuid::new_v4().to_string(),
                     profile: request.profile.clone(),
                     level,
-                    process: request.origin,
+                    process: grant_process,
                     created_at: now_millis(),
                 });
             }
@@ -524,7 +531,8 @@ impl Controller {
         }
         drop(self.vault.reveal(&secret)?);
         let group = self.vault.group(&secret)?;
-        if verified && let Some(grant) = self.grants.find(&secret, group.as_deref(), &origin) {
+        if verified && let Some(grant) = self.grants.find(&secret, group.as_deref(), &process_tree)
+        {
             self.record_audit(AuditEntry {
                 id: String::new(),
                 occurred_at: 0,
@@ -601,6 +609,7 @@ impl Controller {
         decision: ApprovalDecision,
         ttl_seconds: Option<u64>,
         mut scope: GrantScope,
+        grant_process: Option<ProcessIdentity>,
     ) -> Result<(), VaultError> {
         let request = self
             .pending
@@ -625,12 +634,21 @@ impl Controller {
             GrantScope::Secret => request.secret.clone(),
             GrantScope::Group => request.group.clone().expect("group scope was validated"),
         };
-        if decision == ApprovalDecision::Temporary {
+        let grant_process = if decision == ApprovalDecision::Temporary {
+            Some(validated_grant_process(
+                &request.process_tree,
+                &request.origin,
+                grant_process,
+            )?)
+        } else {
+            None
+        };
+        if let Some(grant_process) = &grant_process {
             self.grants
                 .add(
                     scope,
                     resource.clone(),
-                    request.origin.clone(),
+                    grant_process.clone(),
                     ttl_seconds.unwrap_or(0),
                 )
                 .map_err(VaultError)?;
@@ -649,7 +667,7 @@ impl Controller {
             resource: (decision != ApprovalDecision::Deny).then_some(resource),
             ttl_seconds: (decision == ApprovalDecision::Temporary)
                 .then_some(ttl_seconds.unwrap_or(0)),
-            process: request.origin,
+            process: grant_process.unwrap_or(request.origin),
         });
         self.pending.remove(id);
         self.waiting_for_unlock.remove(id);
@@ -701,6 +719,24 @@ fn normalize_aws_profile(profile: &str) -> Result<String, VaultError> {
     let profile = profile.trim();
     validate_aws_profile(profile).map_err(VaultError)?;
     Ok(profile.to_string())
+}
+
+fn validated_grant_process(
+    process_tree: &[ProcessIdentity],
+    origin: &ProcessIdentity,
+    selected: Option<ProcessIdentity>,
+) -> Result<ProcessIdentity, VaultError> {
+    let selected = selected.unwrap_or_else(|| origin.clone());
+    if is_launchd_process(&selected) {
+        return Err(VaultError(
+            "launchd cannot be used as a grant boundary".into(),
+        ));
+    }
+    process_tree
+        .iter()
+        .find(|process| same_process(process, &selected))
+        .cloned()
+        .ok_or_else(|| VaultError("Selected process is not in the verified process tree".into()))
 }
 
 #[cfg(test)]
@@ -757,7 +793,7 @@ mod tests {
             panic!("first request should require a decision");
         };
         controller
-            .respond_aws(&id, Some(AwsAccessLevel::ReadOnly))
+            .respond_aws(&id, Some(AwsAccessLevel::ReadOnly), None)
             .unwrap();
         assert_eq!(
             receiver.recv().unwrap(),
@@ -812,10 +848,10 @@ mod tests {
         };
 
         controller
-            .respond_aws(&admin_id, Some(AwsAccessLevel::Admin))
+            .respond_aws(&admin_id, Some(AwsAccessLevel::Admin), None)
             .unwrap();
         controller
-            .respond_aws(&read_only_id, Some(AwsAccessLevel::ReadOnly))
+            .respond_aws(&read_only_id, Some(AwsAccessLevel::ReadOnly), None)
             .unwrap();
 
         let grants = controller.snapshot().aws_grants;
@@ -826,6 +862,35 @@ mod tests {
                 .begin_aws_request("prod", vec![terraform], true)
                 .unwrap(),
             AwsRequestOutcome::Immediate(AwsAccessLevel::ReadOnly)
+        ));
+    }
+
+    #[test]
+    fn aws_grant_for_an_ancestor_is_reused_by_another_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(directory.path().join("vault.json"));
+        controller.create_vault("correct horse").unwrap();
+        controller
+            .save_aws_configuration(aws_configuration())
+            .unwrap();
+        let ancestor = live_process();
+        let first_child = process(20, "/usr/local/bin/terraform");
+        let AwsRequestOutcome::Pending { id, .. } = controller
+            .begin_aws_request("prod", vec![first_child, ancestor.clone()], true)
+            .unwrap()
+        else {
+            panic!("first child should require approval");
+        };
+        controller
+            .respond_aws(&id, Some(AwsAccessLevel::Admin), Some(ancestor.clone()))
+            .unwrap();
+
+        let second_child = process(21, "/usr/local/bin/terraform");
+        assert!(matches!(
+            controller
+                .begin_aws_request("prod", vec![second_child, ancestor], true)
+                .unwrap(),
+            AwsRequestOutcome::Immediate(AwsAccessLevel::Admin)
         ));
     }
 
@@ -913,6 +978,7 @@ mod tests {
                 ApprovalDecision::Temporary,
                 Some(300),
                 GrantScope::Group,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -930,6 +996,73 @@ mod tests {
             controller.snapshot().audit[0].action,
             AuditAction::AutoGranted
         );
+    }
+
+    #[test]
+    fn secret_grant_for_an_ancestor_is_reused_by_another_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(directory.path().join("vault.json"));
+        controller.create_vault("correct horse").unwrap();
+        controller
+            .save_secret("deploy/token", "secret", None, None)
+            .unwrap();
+        let ancestor = process(10, "/bin/zsh");
+        let first_child = process(20, "/usr/local/bin/terraform");
+        let RequestOutcome::Pending { id, .. } = controller
+            .begin_request("deploy/token", vec![first_child, ancestor.clone()], true)
+            .unwrap()
+        else {
+            panic!("first child should require approval");
+        };
+        controller
+            .respond(
+                &id,
+                ApprovalDecision::Temporary,
+                Some(300),
+                GrantScope::Secret,
+                Some(ancestor.clone()),
+            )
+            .unwrap();
+
+        let second_child = process(21, "/usr/local/bin/terraform");
+        assert!(matches!(
+            controller
+                .begin_request("deploy/token", vec![second_child, ancestor], true)
+                .unwrap(),
+            RequestOutcome::Immediate(_)
+        ));
+    }
+
+    #[test]
+    fn launchd_cannot_be_selected_as_a_grant_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(directory.path().join("vault.json"));
+        controller.create_vault("correct horse").unwrap();
+        controller
+            .save_secret("token", "secret", None, None)
+            .unwrap();
+        let launchd = process(1, "/sbin/launchd");
+        let RequestOutcome::Pending { id, .. } = controller
+            .begin_request(
+                "token",
+                vec![process(20, "/usr/local/bin/tool"), launchd.clone()],
+                true,
+            )
+            .unwrap()
+        else {
+            panic!("request should require approval");
+        };
+
+        let error = controller
+            .respond(
+                &id,
+                ApprovalDecision::Temporary,
+                Some(300),
+                GrantScope::Secret,
+                Some(launchd),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("launchd"));
     }
 
     #[test]
@@ -956,7 +1089,7 @@ mod tests {
             Some("ro")
         );
         controller
-            .respond(&id, ApprovalDecision::Once, None, GrantScope::Secret)
+            .respond(&id, ApprovalDecision::Once, None, GrantScope::Secret, None)
             .unwrap();
         assert_eq!(
             receiver.recv_timeout(Duration::from_secs(1)).unwrap(),

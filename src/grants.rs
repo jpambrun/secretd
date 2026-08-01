@@ -66,19 +66,22 @@ impl GrantStore {
         &mut self,
         secret: &str,
         group: Option<&str>,
-        process: &ProcessIdentity,
+        process_tree: &[ProcessIdentity],
     ) -> Option<Grant> {
         self.cleanup();
-        self.grants
-            .iter()
-            .find(|grant| {
-                let resource_matches = match grant.scope {
-                    GrantScope::Secret => grant.resource == secret,
-                    GrantScope::Group => group.is_some_and(|group| grant.resource == group),
-                };
-                resource_matches && same_process(&grant.process, process)
-            })
-            .cloned()
+        process_tree.iter().find_map(|process| {
+            self.grants
+                .iter()
+                .rev()
+                .find(|grant| {
+                    let resource_matches = match grant.scope {
+                        GrantScope::Secret => grant.resource == secret,
+                        GrantScope::Group => group.is_some_and(|group| grant.resource == group),
+                    };
+                    resource_matches && same_process(&grant.process, process)
+                })
+                .cloned()
+        })
     }
 
     pub fn list(&mut self) -> Vec<Grant> {
@@ -130,13 +133,29 @@ mod tests {
             .unwrap();
         assert!(
             grants
-                .find("aws/key", Some("aws-read-only"), &process())
+                .find("aws/key", Some("aws-read-only"), &[process()])
                 .is_some()
         );
         assert!(
             grants
-                .find("aws/key", Some("aws-admin"), &process())
+                .find("aws/key", Some("aws-admin"), &[process()])
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_grant_for_an_ancestor_matches_its_descendants() {
+        let ancestor = process();
+        let mut child = process();
+        child.pid = 43;
+        child.ppid = ancestor.pid;
+        child.started_at = "child-start".into();
+        child.executable = "/bin/child".into();
+        let mut grants = GrantStore::default();
+        grants
+            .add(GrantScope::Secret, "token".into(), ancestor.clone(), 30)
+            .unwrap();
+
+        assert!(grants.find("token", None, &[child, ancestor]).is_some());
     }
 }

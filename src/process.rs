@@ -42,6 +42,28 @@ pub fn same_process(left: &ProcessIdentity, right: &ProcessIdentity) -> bool {
         && left.executable == right.executable
 }
 
+pub fn is_launchd_process(process: &ProcessIdentity) -> bool {
+    let executable = process
+        .executable
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let invoked = process
+        .command
+        .trim()
+        .replace('\\', "/")
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    executable == "launchd" || invoked == "launchd"
+}
+
 pub fn process_is_alive(process: &ProcessIdentity) -> bool {
     inspect_process(process.pid)
         .ok()
@@ -279,5 +301,21 @@ mod tests {
         let mut reused_pid = current;
         reused_pid.started_at.push_str("-different");
         assert!(!process_is_alive(&reused_pid));
+    }
+
+    #[test]
+    fn identifies_launchd_by_pid_or_executable() {
+        assert!(is_launchd_process(&process(
+            1,
+            "/sbin/launchd",
+            "/sbin/launchd"
+        )));
+        assert!(is_launchd_process(&process(
+            99,
+            "/sbin/launchd",
+            "/sbin/launchd"
+        )));
+        assert!(!is_launchd_process(&process(20, "/bin/zsh", "-zsh")));
+        assert!(!is_launchd_process(&process(1, "/sbin/init", "/sbin/init")));
     }
 }

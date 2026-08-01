@@ -25,7 +25,7 @@ use winit::{
     event::{StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     raw_window_handle::HasWindowHandle,
-    window::{Window, WindowAttributes, WindowId, WindowLevel},
+    window::{Window, WindowAttributes, WindowId},
 };
 
 use crate::app::{AppEvent, RequestDialogAction, SecretDApp, background_color, configure_style};
@@ -37,7 +37,7 @@ enum WindowKind {
 }
 
 const MAIN_WINDOW_SIZE: (f64, f64) = (1040.0, 700.0);
-const REQUEST_WINDOW_SIZE: (f64, f64) = (620.0, 430.0);
+const REQUEST_WINDOW_SIZE: (f64, f64) = (620.0, 480.0);
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let mut builder = EventLoop::<AppEvent>::with_user_event();
@@ -444,8 +444,7 @@ impl GlutinWindowContext {
                     REQUEST_WINDOW_SIZE.0,
                     REQUEST_WINDOW_SIZE.1,
                 ))
-                .with_title("SecretD Access Request")
-                .with_window_level(WindowLevel::AlwaysOnTop),
+                .with_title("SecretD Access Request"),
         }
         .with_visible(false);
         let config_template = ConfigTemplateBuilder::new()
@@ -553,5 +552,6 @@ mod tests {
     fn request_window_is_compact_relative_to_the_main_window() {
         assert!(REQUEST_WINDOW_SIZE.0 < MAIN_WINDOW_SIZE.0);
         assert!(REQUEST_WINDOW_SIZE.1 < MAIN_WINDOW_SIZE.1);
+        assert!(REQUEST_WINDOW_SIZE.1 >= 480.0);
     }
 }
