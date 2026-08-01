@@ -10,10 +10,10 @@ use zeroize::Zeroizing;
 use crate::{
     aws::{
         AwsAccessLevel, AwsBroker, AwsConfiguration, AwsLoginStatus, AwsSettings,
-        AwsSettingsSummary,
+        AwsSettingsSummary, validate_aws_profile,
     },
     grants::{Grant, GrantScope, GrantStore, MAX_GRANT_SECONDS, now_millis},
-    process::{ProcessIdentity, omit_secretd_client_processes},
+    process::{ProcessIdentity, omit_secretd_client_processes, process_is_alive},
     vault::{SecretSummary, VaultError, VaultStore, normalize_secret_name},
 };
 
@@ -153,6 +153,8 @@ impl Controller {
     }
 
     pub fn snapshot(&mut self) -> AppSnapshot {
+        self.aws_process_decisions
+            .retain(|decision| process_is_alive(&decision.process));
         let vault_exists = self.vault.exists().unwrap_or(false);
         let unlocked = self.vault.unlocked();
         let secrets = if unlocked {
@@ -291,6 +293,12 @@ impl Controller {
     }
 
     pub fn prepare_aws_login(&mut self) -> Result<(AwsBroker, AwsSettings), VaultError> {
+        let context = self.preview_aws_login()?;
+        self.aws_login = AwsLoginStatus::Starting;
+        Ok(context)
+    }
+
+    pub fn preview_aws_login(&self) -> Result<(AwsBroker, AwsSettings), VaultError> {
         if matches!(
             self.aws_login,
             AwsLoginStatus::Starting
@@ -304,7 +312,6 @@ impl Controller {
             .aws_settings()?
             .ok_or_else(|| VaultError("Configure AWS SSO before logging in".into()))?;
         settings.validate().map_err(VaultError)?;
-        self.aws_login = AwsLoginStatus::Starting;
         Ok((self.aws_broker.clone(), settings))
     }
 
@@ -344,6 +351,8 @@ impl Controller {
         verified: bool,
     ) -> Result<AwsRequestOutcome, VaultError> {
         let profile = normalize_aws_profile(profile)?;
+        self.aws_process_decisions
+            .retain(|decision| process_is_alive(&decision.process));
         let process_tree = omit_secretd_client_processes(&process_tree);
         let Some(origin) = process_tree.first().cloned() else {
             return Err(VaultError(
@@ -400,6 +409,10 @@ impl Controller {
                 .target(&request.profile)
                 .map_err(VaultError)?;
             if request.verified {
+                self.aws_process_decisions.retain(|decision| {
+                    decision.profile != request.profile
+                        || !crate::process::same_process(&decision.process, &request.origin)
+                });
                 self.aws_process_decisions.push(AwsCredentialGrant {
                     id: Uuid::new_v4().to_string(),
                     profile: request.profile.clone(),
@@ -437,8 +450,8 @@ impl Controller {
         Ok((self.aws_broker.clone(), settings))
     }
 
-    pub fn persist_aws_settings(&mut self, settings: AwsSettings) -> Result<(), VaultError> {
-        self.persist_aws_session(&settings, false)
+    pub fn persist_aws_settings(&mut self, settings: &AwsSettings) -> Result<(), VaultError> {
+        self.persist_aws_session(settings, false)
     }
 
     fn persist_aws_session(
@@ -686,15 +699,7 @@ impl Controller {
 
 fn normalize_aws_profile(profile: &str) -> Result<String, VaultError> {
     let profile = profile.trim();
-    if profile.is_empty()
-        || profile.len() > 128
-        || profile.chars().any(char::is_control)
-        || !profile
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err(VaultError("AWS profile is invalid".into()));
-    }
+    validate_aws_profile(profile).map_err(VaultError)?;
     Ok(profile.to_string())
 }
 
@@ -712,6 +717,14 @@ mod tests {
             executable: executable.into(),
             command: executable.into(),
         }
+    }
+
+    fn live_process() -> ProcessIdentity {
+        crate::process::inspect_process_tree(std::process::id(), 1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
     }
 
     fn aws_configuration() -> AwsConfiguration {
@@ -736,7 +749,7 @@ mod tests {
         controller
             .save_aws_configuration(aws_configuration())
             .unwrap();
-        let terraform = process(42, "/usr/local/bin/terraform-provider-aws");
+        let terraform = live_process();
         let outcome = controller
             .begin_aws_request("prod", vec![terraform.clone()], true)
             .unwrap();
@@ -775,6 +788,63 @@ mod tests {
     }
 
     #[test]
+    fn latest_aws_approval_replaces_an_older_grant() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(directory.path().join("vault.json"));
+        controller.create_vault("correct horse").unwrap();
+        controller
+            .save_aws_configuration(aws_configuration())
+            .unwrap();
+        let terraform = live_process();
+        let AwsRequestOutcome::Pending { id: admin_id, .. } = controller
+            .begin_aws_request("prod", vec![terraform.clone()], true)
+            .unwrap()
+        else {
+            panic!("admin request should be pending");
+        };
+        let AwsRequestOutcome::Pending {
+            id: read_only_id, ..
+        } = controller
+            .begin_aws_request("prod", vec![terraform.clone()], true)
+            .unwrap()
+        else {
+            panic!("read-only request should be pending");
+        };
+
+        controller
+            .respond_aws(&admin_id, Some(AwsAccessLevel::Admin))
+            .unwrap();
+        controller
+            .respond_aws(&read_only_id, Some(AwsAccessLevel::ReadOnly))
+            .unwrap();
+
+        let grants = controller.snapshot().aws_grants;
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].level, AwsAccessLevel::ReadOnly);
+        assert!(matches!(
+            controller
+                .begin_aws_request("prod", vec![terraform], true)
+                .unwrap(),
+            AwsRequestOutcome::Immediate(AwsAccessLevel::ReadOnly)
+        ));
+    }
+
+    #[test]
+    fn snapshot_prunes_aws_grants_for_exited_processes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(directory.path().join("vault.json"));
+        controller.aws_process_decisions.push(AwsCredentialGrant {
+            id: "stale".into(),
+            profile: "prod".into(),
+            level: AwsAccessLevel::Admin,
+            process: process(u32::MAX, "/missing/terraform"),
+            created_at: now_millis(),
+        });
+
+        assert!(controller.snapshot().aws_grants.is_empty());
+    }
+
+    #[test]
     fn aws_session_refresh_does_not_overwrite_newer_profile_configuration() {
         let directory = tempfile::tempdir().unwrap();
         let mut controller = Controller::new(directory.path().join("vault.json"));
@@ -792,7 +862,7 @@ mod tests {
             access_token_expires_at: u64::MAX,
             refresh_token: "refresh".into(),
         });
-        controller.persist_aws_settings(stale).unwrap();
+        controller.persist_aws_settings(&stale).unwrap();
 
         let settings = controller.vault.aws_settings().unwrap().unwrap();
         assert_eq!(settings.targets[0].admin_role, "NewAdministrator");

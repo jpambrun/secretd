@@ -135,7 +135,7 @@ impl AwsSettings {
         validate_identifier(&self.sso_region, "SSO region")?;
         let mut profiles = std::collections::HashSet::new();
         for target in &self.targets {
-            validate_identifier(&target.profile, "AWS profile")?;
+            validate_aws_profile(&target.profile)?;
             if !profiles.insert(&target.profile) {
                 return Err(format!("AWS profile '{}' is duplicated", target.profile));
             }
@@ -685,6 +685,18 @@ fn validate_identifier(value: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn validate_aws_profile(profile: &str) -> Result<(), String> {
+    if profile.is_empty()
+        || profile.len() > 128
+        || !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("AWS profile is invalid".into());
+    }
+    Ok(())
+}
+
 pub fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -731,6 +743,13 @@ mod tests {
         settings.targets.pop();
         settings.targets[0].account_id = "123".into();
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_profile_aliases_the_credential_helper_cannot_use() {
+        let mut settings = settings();
+        settings.targets[0].profile = "prod.ca".into();
+        assert_eq!(settings.validate().unwrap_err(), "AWS profile is invalid");
     }
 
     #[test]

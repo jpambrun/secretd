@@ -53,10 +53,16 @@ pub enum AppEvent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestDialogAction {
+    None,
+    Close,
+    OpenMain,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
     Secrets,
     Aws,
-    Requests,
     Grants,
     Activity,
 }
@@ -129,6 +135,7 @@ pub struct SecretDApp {
     revealed: Option<(String, Zeroizing<String>)>,
     delete_confirmation: Option<String>,
     request_choices: HashMap<String, RequestChoice>,
+    request_error: Option<String>,
     toast: Option<Toast>,
 }
 
@@ -209,6 +216,7 @@ impl SecretDApp {
             revealed: None,
             delete_confirmation: None,
             request_choices: HashMap::new(),
+            request_error: None,
             toast: None,
         })
     }
@@ -237,9 +245,7 @@ impl SecretDApp {
 
     pub fn refresh_state(&mut self) {
         let snapshot = self.snapshot();
-        if !snapshot.pending.is_empty() || !snapshot.pending_aws.is_empty() {
-            self.view = View::Requests;
-        } else if matches!(
+        if matches!(
             snapshot.aws_login,
             AwsLoginStatus::Starting
                 | AwsLoginStatus::AwaitingUser(_)
@@ -258,17 +264,21 @@ impl SecretDApp {
         self.refresh_tray(&snapshot);
     }
 
-    pub fn has_pending(&self) -> bool {
+    pub fn has_access_requests(&self) -> bool {
         self.controller.lock().is_ok_and(|mut controller| {
             let snapshot = controller.snapshot();
-            !snapshot.pending.is_empty()
-                || !snapshot.pending_aws.is_empty()
-                || matches!(
-                    snapshot.aws_login,
-                    AwsLoginStatus::Starting
-                        | AwsLoginStatus::AwaitingUser(_)
-                        | AwsLoginStatus::Discovering
-                )
+            !snapshot.pending.is_empty() || !snapshot.pending_aws.is_empty()
+        })
+    }
+
+    pub fn aws_login_in_progress(&self) -> bool {
+        self.controller.lock().is_ok_and(|mut controller| {
+            matches!(
+                controller.snapshot().aws_login,
+                AwsLoginStatus::Starting
+                    | AwsLoginStatus::AwaitingUser(_)
+                    | AwsLoginStatus::Discovering
+            )
         })
     }
 
@@ -525,13 +535,6 @@ impl SecretDApp {
                     nav_button(
                         ui,
                         &mut self.view,
-                        View::Requests,
-                        "Requests",
-                        snapshot.pending.len() + snapshot.pending_aws.len(),
-                    );
-                    nav_button(
-                        ui,
-                        &mut self.view,
                         View::Grants,
                         "Active access",
                         snapshot.grants.len() + snapshot.aws_grants.len(),
@@ -553,7 +556,6 @@ impl SecretDApp {
                     .show(ui, |ui| match self.view {
                         View::Secrets => self.secrets_ui(ui, &snapshot),
                         View::Aws => self.aws_ui(ui, &snapshot),
-                        View::Requests => self.requests_ui(ui, &snapshot),
                         View::Grants => self.grants_ui(ui, &snapshot),
                         View::Activity => self.activity_ui(ui, &snapshot),
                     });
@@ -968,150 +970,223 @@ impl SecretDApp {
         }
     }
 
-    fn requests_ui(&mut self, ui: &mut egui::Ui, snapshot: &AppSnapshot) {
-        section_header(
-            ui,
-            "Access requests",
-            "Review who is asking, then choose the narrowest useful access.",
-        );
+    pub fn request_dialog_ui(&mut self, ui: &mut egui::Ui) -> RequestDialogAction {
+        ui.ctx().request_repaint_after(Duration::from_millis(500));
+        let snapshot = self.snapshot();
+        ui.painter().rect_filled(ui.max_rect(), 0, BACKGROUND);
         if snapshot.pending.is_empty() && snapshot.pending_aws.is_empty() {
-            empty_state(ui, "No pending requests");
-            return;
+            return RequestDialogAction::Close;
         }
         let mut response = None;
         let mut aws_response = None;
-        for request in &snapshot.pending_aws {
-            Frame::new()
-                .fill(SURFACE)
-                .stroke(Stroke::new(
-                    1.0,
-                    if request.verified { LINE } else { AMBER },
-                ))
-                .corner_radius(14)
-                .inner_margin(Margin::same(18))
-                .show(ui, |ui| {
-                    aws_request_heading(ui, request);
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(format!(
-                            "{} · PID {}",
-                            request.origin.executable, request.origin.pid
-                        ))
-                        .color(MUTED),
-                    );
-                    egui::CollapsingHeader::new("Process tree").show(ui, |ui| {
-                        for (index, process) in request.process_tree.iter().enumerate() {
-                            ui.monospace(format!(
-                                "{}{} [{}]",
-                                "  ".repeat(index),
-                                process.command,
-                                process.pid
-                            ));
-                        }
-                    });
-                    ui.add_space(8.0);
-                    ui.horizontal_wrapped(|ui| {
-                        if danger_button(ui, "Deny").clicked() {
-                            aws_response = Some((request.id.clone(), None));
-                        }
-                        if secondary_button(ui, "Grant read-only credentials").clicked() {
-                            aws_response =
-                                Some((request.id.clone(), Some(AwsAccessLevel::ReadOnly)));
-                        }
-                        if admin_button(ui, "Grant admin credentials").clicked() {
-                            aws_response = Some((request.id.clone(), Some(AwsAccessLevel::Admin)));
-                        }
+        let mut action = RequestDialogAction::None;
+        Frame::new()
+            .fill(BACKGROUND)
+            .inner_margin(Margin::same(22))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    brand_mark(ui);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Access request")
+                                .size(19.0)
+                                .strong()
+                                .color(INK),
+                        );
+                        ui.label(
+                            RichText::new("Review the requesting process before granting access")
+                                .small()
+                                .color(MUTED),
+                        );
                     });
                 });
-            ui.add_space(10.0);
-        }
-        for request in &snapshot.pending {
-            self.request_choices
-                .entry(request.id.clone())
-                .or_insert(RequestChoice { seconds: 300 });
-            Frame::new()
-                .fill(SURFACE)
-                .stroke(Stroke::new(
-                    1.0,
-                    if request.verified { LINE } else { AMBER },
-                ))
-                .corner_radius(14)
-                .inner_margin(Margin::same(18))
-                .show(ui, |ui| {
-                    request_heading(ui, request);
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(format!(
-                            "{} · PID {}",
-                            request.origin.executable, request.origin.pid
-                        ))
-                        .color(MUTED),
-                    );
-                    egui::CollapsingHeader::new("Process tree").show(ui, |ui| {
-                        for (index, process) in request.process_tree.iter().enumerate() {
-                            ui.monospace(format!(
-                                "{}{} [{}]",
-                                "  ".repeat(index),
-                                process.command,
-                                process.pid
-                            ));
-                        }
-                    });
-                    ui.add_space(8.0);
-                    ui.horizontal_wrapped(|ui| {
-                        if danger_button(ui, "Deny").clicked() {
-                            response = Some((
-                                request.id.clone(),
-                                ApprovalDecision::Deny,
-                                None,
-                                GrantScope::Secret,
-                            ));
-                        }
-                        if secondary_button(ui, "Allow once").clicked() {
-                            response = Some((
-                                request.id.clone(),
-                                ApprovalDecision::Once,
-                                None,
-                                GrantScope::Secret,
-                            ));
-                        }
-                        if request.verified {
-                            let choice = self.request_choices.get_mut(&request.id).unwrap();
-                            egui::ComboBox::from_id_salt(format!("ttl-{}", request.id))
-                                .selected_text(duration_label(choice.seconds))
-                                .show_ui(ui, |ui| {
-                                    for seconds in [60, 300, 900, 3600] {
-                                        ui.selectable_value(
-                                            &mut choice.seconds,
-                                            seconds,
-                                            duration_label(seconds),
-                                        );
-                                    }
-                                });
-                            if primary_button(ui, "Grant this secret").clicked() {
-                                response = Some((
-                                    request.id.clone(),
-                                    ApprovalDecision::Temporary,
-                                    Some(choice.seconds),
-                                    GrantScope::Secret,
-                                ));
-                            }
-                            if let Some(group) = &request.group {
-                                let label = group_grant_label(group);
-                                if primary_button(ui, &label).clicked() {
-                                    response = Some((
-                                        request.id.clone(),
-                                        ApprovalDecision::Temporary,
-                                        Some(choice.seconds),
-                                        GrantScope::Group,
-                                    ));
+                if let Some(error) = &self.request_error {
+                    ui.add_space(10.0);
+                    error_banner(ui, error);
+                }
+                ui.add_space(14.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let show_aws =
+                            match (snapshot.pending_aws.first(), snapshot.pending.first()) {
+                                (Some(aws), Some(secret)) => {
+                                    aws.requested_at <= secret.requested_at
                                 }
-                            }
+                                (Some(_), None) => true,
+                                _ => false,
+                            };
+                        if show_aws {
+                            let request = snapshot
+                                .pending_aws
+                                .first()
+                                .expect("AWS request was selected");
+                            Frame::new()
+                                .fill(SURFACE)
+                                .stroke(Stroke::new(
+                                    1.0,
+                                    if request.verified { LINE } else { AMBER },
+                                ))
+                                .corner_radius(14)
+                                .inner_margin(Margin::same(18))
+                                .show(ui, |ui| {
+                                    aws_request_heading(ui, request);
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} · PID {}",
+                                            request.origin.executable, request.origin.pid
+                                        ))
+                                        .color(MUTED),
+                                    );
+                                    egui::CollapsingHeader::new("Process tree").show(ui, |ui| {
+                                        for (index, process) in
+                                            request.process_tree.iter().enumerate()
+                                        {
+                                            ui.monospace(format!(
+                                                "{}{} [{}]",
+                                                "  ".repeat(index),
+                                                process.command,
+                                                process.pid
+                                            ));
+                                        }
+                                    });
+                                    ui.add_space(8.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        if danger_button(ui, "Deny").clicked() {
+                                            aws_response = Some((request.id.clone(), None));
+                                        }
+                                        if snapshot.unlocked {
+                                            if secondary_button(ui, "Grant read-only credentials")
+                                                .clicked()
+                                            {
+                                                aws_response = Some((
+                                                    request.id.clone(),
+                                                    Some(AwsAccessLevel::ReadOnly),
+                                                ));
+                                            }
+                                            if admin_button(ui, "Grant admin credentials").clicked()
+                                            {
+                                                aws_response = Some((
+                                                    request.id.clone(),
+                                                    Some(AwsAccessLevel::Admin),
+                                                ));
+                                            }
+                                        } else if primary_button(ui, "Open SecretD to unlock")
+                                            .clicked()
+                                        {
+                                            action = RequestDialogAction::OpenMain;
+                                        }
+                                    });
+                                });
+                        } else {
+                            let request = snapshot
+                                .pending
+                                .first()
+                                .expect("secret request was selected");
+                            self.request_choices
+                                .entry(request.id.clone())
+                                .or_insert(RequestChoice { seconds: 300 });
+                            Frame::new()
+                                .fill(SURFACE)
+                                .stroke(Stroke::new(
+                                    1.0,
+                                    if request.verified { LINE } else { AMBER },
+                                ))
+                                .corner_radius(14)
+                                .inner_margin(Margin::same(18))
+                                .show(ui, |ui| {
+                                    request_heading(ui, request);
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} · PID {}",
+                                            request.origin.executable, request.origin.pid
+                                        ))
+                                        .color(MUTED),
+                                    );
+                                    egui::CollapsingHeader::new("Process tree").show(ui, |ui| {
+                                        for (index, process) in
+                                            request.process_tree.iter().enumerate()
+                                        {
+                                            ui.monospace(format!(
+                                                "{}{} [{}]",
+                                                "  ".repeat(index),
+                                                process.command,
+                                                process.pid
+                                            ));
+                                        }
+                                    });
+                                    ui.add_space(8.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        if danger_button(ui, "Deny").clicked() {
+                                            response = Some((
+                                                request.id.clone(),
+                                                ApprovalDecision::Deny,
+                                                None,
+                                                GrantScope::Secret,
+                                            ));
+                                        }
+                                        if snapshot.unlocked
+                                            && secondary_button(ui, "Allow once").clicked()
+                                        {
+                                            response = Some((
+                                                request.id.clone(),
+                                                ApprovalDecision::Once,
+                                                None,
+                                                GrantScope::Secret,
+                                            ));
+                                        }
+                                        if snapshot.unlocked && request.verified {
+                                            let choice =
+                                                self.request_choices.get_mut(&request.id).unwrap();
+                                            egui::ComboBox::from_id_salt(format!(
+                                                "ttl-{}",
+                                                request.id
+                                            ))
+                                            .selected_text(duration_label(choice.seconds))
+                                            .show_ui(
+                                                ui,
+                                                |ui| {
+                                                    for seconds in [60, 300, 900, 3600] {
+                                                        ui.selectable_value(
+                                                            &mut choice.seconds,
+                                                            seconds,
+                                                            duration_label(seconds),
+                                                        );
+                                                    }
+                                                },
+                                            );
+                                            if primary_button(ui, "Grant this secret").clicked() {
+                                                response = Some((
+                                                    request.id.clone(),
+                                                    ApprovalDecision::Temporary,
+                                                    Some(choice.seconds),
+                                                    GrantScope::Secret,
+                                                ));
+                                            }
+                                            if let Some(group) = &request.group {
+                                                let label = group_grant_label(group);
+                                                if primary_button(ui, &label).clicked() {
+                                                    response = Some((
+                                                        request.id.clone(),
+                                                        ApprovalDecision::Temporary,
+                                                        Some(choice.seconds),
+                                                        GrantScope::Group,
+                                                    ));
+                                                }
+                                            }
+                                        } else if !snapshot.unlocked
+                                            && primary_button(ui, "Open SecretD to unlock")
+                                                .clicked()
+                                        {
+                                            action = RequestDialogAction::OpenMain;
+                                        }
+                                    });
+                                });
                         }
                     });
-                });
-            ui.add_space(10.0);
-        }
+            });
         if let Some((id, decision, seconds, scope)) = response {
             let result = self
                 .controller
@@ -1122,8 +1197,12 @@ impl SecretDApp {
                         .respond(&id, decision, seconds, scope)
                         .map_err(|error| error.to_string())
                 });
-            if let Err(error) = result {
-                self.toast(error, true);
+            match result {
+                Ok(()) => {
+                    self.request_error = None;
+                    action = RequestDialogAction::Close;
+                }
+                Err(error) => self.request_error = Some(error),
             }
             self.request_choices.remove(&id);
             self.refresh_state();
@@ -1138,11 +1217,44 @@ impl SecretDApp {
                         .respond_aws(&id, level)
                         .map_err(|error| error.to_string())
                 });
-            if let Err(error) = result {
-                self.toast(error, true);
+            match result {
+                Ok(()) => {
+                    self.request_error = None;
+                    action = RequestDialogAction::Close;
+                }
+                Err(error) => self.request_error = Some(error),
             }
             self.refresh_state();
         }
+        action
+    }
+
+    pub fn deny_oldest_request(&mut self) {
+        let snapshot = self.snapshot();
+        let deny_aws = match (snapshot.pending_aws.first(), snapshot.pending.first()) {
+            (Some(aws), Some(secret)) => aws.requested_at <= secret.requested_at,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if deny_aws {
+            if let Some(request) = snapshot.pending_aws.first()
+                && let Ok(mut controller) = self.controller.lock()
+            {
+                let _ = controller.respond_aws(&request.id, None);
+            }
+        } else if let Some(request) = snapshot.pending.first()
+            && let Ok(mut controller) = self.controller.lock()
+        {
+            let _ = controller.respond(
+                &request.id,
+                ApprovalDecision::Deny,
+                None,
+                GrantScope::Secret,
+            );
+            self.request_choices.remove(&request.id);
+        }
+        self.request_error = None;
+        self.refresh_state();
     }
 
     fn grants_ui(&mut self, ui: &mut egui::Ui, snapshot: &AppSnapshot) {
@@ -1703,6 +1815,7 @@ impl SecretDApp {
         self.aws_draft = None;
         self.revealed = None;
         self.form_error = None;
+        self.request_error = None;
         self.auth_focus_requested = false;
     }
 }

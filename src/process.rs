@@ -42,6 +42,13 @@ pub fn same_process(left: &ProcessIdentity, right: &ProcessIdentity) -> bool {
         && left.executable == right.executable
 }
 
+pub fn process_is_alive(process: &ProcessIdentity) -> bool {
+    inspect_process(process.pid)
+        .ok()
+        .flatten()
+        .is_some_and(|current| same_process(&current, process))
+}
+
 pub fn omit_secretd_client_processes(tree: &[ProcessIdentity]) -> Vec<ProcessIdentity> {
     tree.iter()
         .skip_while(|process| is_secretd_client_process(process))
@@ -258,5 +265,19 @@ mod tests {
             omit_secretd_client_processes(&[cli, deno, shell.clone()]),
             [shell]
         );
+    }
+
+    #[test]
+    fn checks_the_full_identity_of_a_live_process() {
+        let current = inspect_process_tree(std::process::id(), 1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(process_is_alive(&current));
+
+        let mut reused_pid = current;
+        reused_pid.started_at.push_str("-different");
+        assert!(!process_is_alive(&reused_pid));
     }
 }

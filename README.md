@@ -63,11 +63,12 @@ credential_process = /absolute/path/to/secretd aws credentials prod
 region = ca-central-1
 ```
 
-4. Run tools normally. When a process asks for a configured profile, SecretD shows its verified
-   process tree and asks whether to deny the request or issue read-only or admin credentials. If the
-   SSO session has expired, SecretD opens its window, displays the AWS verification URL and device
-   code, waits for login, and then resumes the original credential request. `secretd aws login`
-   remains available for an explicit refresh and account rediscovery.
+4. Run tools normally. When a process asks for a configured profile, SecretD opens a compact,
+   independent approval window with its verified process tree and asks whether to deny the request
+   or grant read-only or admin credentials. The approval window closes after the decision. If the
+   SSO session has expired, SecretD opens its main window, displays the AWS verification URL and
+   device code, waits for login, and then resumes the original credential request. `secretd aws
+   login` remains available for an explicit refresh and account rediscovery.
 
 This supports a saved-plan workflow without a caller-controlled access-level variable:
 

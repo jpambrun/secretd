@@ -294,7 +294,13 @@ fn handle_aws_request(
         .map_err(|_| "SecretD state is unavailable".to_string())?
         .aws_credential_context()
         .map_err(|error| error.to_string())?;
-    let credentials = match broker.credentials(&mut settings, profile, level) {
+    let first_attempt = broker.credentials(&mut settings, profile, level);
+    controller
+        .lock()
+        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .persist_aws_settings(&settings)
+        .map_err(|error| error.to_string())?;
+    let credentials = match first_attempt {
         Ok(credentials) => credentials,
         Err(error) if is_session_expired_error(&error) => {
             let (_, login_settings) = controller
@@ -314,17 +320,16 @@ fn handle_aws_request(
                 .map_err(|_| "SecretD state is unavailable".to_string())?
                 .aws_credential_context()
                 .map_err(|error| error.to_string())?;
-            let credentials = broker.credentials(&mut refreshed_settings, profile, level)?;
-            settings = refreshed_settings;
-            credentials
+            let credentials = broker.credentials(&mut refreshed_settings, profile, level);
+            controller
+                .lock()
+                .map_err(|_| "SecretD state is unavailable".to_string())?
+                .persist_aws_settings(&refreshed_settings)
+                .map_err(|error| error.to_string())?;
+            credentials?
         }
         Err(error) => return Err(error),
     };
-    controller
-        .lock()
-        .map_err(|_| "SecretD state is unavailable".to_string())?
-        .persist_aws_settings(settings)
-        .map_err(|error| error.to_string())?;
     notify();
     serde_json::to_string(&credentials)
         .map(Zeroizing::new)
@@ -335,18 +340,40 @@ pub fn begin_aws_login(
     controller: Arc<Mutex<Controller>>,
     notify: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<(), String> {
-    let (broker, settings) = controller
+    let (broker, initial_settings) = controller
         .lock()
         .map_err(|_| "SecretD state is unavailable".to_string())?
-        .prepare_aws_login()
+        .preview_aws_login()
         .map_err(|error| error.to_string())?;
-    notify();
+    let initial_expiration = initial_settings
+        .token
+        .as_ref()
+        .map(|token| token.access_token_expires_at);
     let login_controller = Arc::clone(&controller);
     let login_notify = Arc::clone(&notify);
     let spawn_result = thread::Builder::new()
         .name("secretd-aws-login".into())
         .spawn(move || {
             let result = broker.operation().and_then(|_operation| {
+                let current_expiration = login_controller
+                    .lock()
+                    .map_err(|_| "SecretD state is unavailable".to_string())?
+                    .aws_credential_context()
+                    .map_err(|error| error.to_string())?
+                    .1
+                    .token
+                    .as_ref()
+                    .map(|token| token.access_token_expires_at);
+                if current_expiration != initial_expiration {
+                    login_notify();
+                    return Ok(());
+                }
+                let (_, settings) = login_controller
+                    .lock()
+                    .map_err(|_| "SecretD state is unavailable".to_string())?
+                    .prepare_aws_login()
+                    .map_err(|error| error.to_string())?;
+                login_notify();
                 run_aws_login(
                     &broker,
                     settings,

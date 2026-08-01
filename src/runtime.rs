@@ -25,10 +25,19 @@ use winit::{
     event::{StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     raw_window_handle::HasWindowHandle,
-    window::{Window, WindowAttributes, WindowId},
+    window::{Window, WindowAttributes, WindowId, WindowLevel},
 };
 
-use crate::app::{AppEvent, SecretDApp, background_color, configure_style};
+use crate::app::{AppEvent, RequestDialogAction, SecretDApp, background_color, configure_style};
+
+#[derive(Clone, Copy)]
+enum WindowKind {
+    Main,
+    Request,
+}
+
+const MAIN_WINDOW_SIZE: (f64, f64) = (1040.0, 700.0);
+const REQUEST_WINDOW_SIZE: (f64, f64) = (620.0, 430.0);
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let mut builder = EventLoop::<AppEvent>::with_user_event();
@@ -49,6 +58,7 @@ struct Runtime {
     proxy: EventLoopProxy<AppEvent>,
     app: Option<SecretDApp>,
     ui: Option<UiRuntime>,
+    request_ui: Option<UiRuntime>,
     repaint_at: Option<Instant>,
 }
 
@@ -58,6 +68,7 @@ impl Runtime {
             proxy,
             app: None,
             ui: None,
+            request_ui: None,
             repaint_at: None,
         }
     }
@@ -69,7 +80,7 @@ impl Runtime {
             ui.window().request_redraw();
             return;
         }
-        match UiRuntime::new(event_loop, self.proxy.clone()) {
+        match UiRuntime::new(event_loop, self.proxy.clone(), WindowKind::Main) {
             Ok(ui) => {
                 self.ui = Some(ui);
                 self.ui
@@ -79,6 +90,26 @@ impl Runtime {
                     .request_redraw();
             }
             Err(error) => eprintln!("Could not open SecretD window: {error}"),
+        }
+    }
+
+    fn open_request_ui(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(ui) = &self.request_ui {
+            ui.window().set_visible(true);
+            ui.window().focus_window();
+            ui.window().request_redraw();
+            return;
+        }
+        match UiRuntime::new(event_loop, self.proxy.clone(), WindowKind::Request) {
+            Ok(ui) => {
+                self.request_ui = Some(ui);
+                self.request_ui
+                    .as_ref()
+                    .expect("request UI was just created")
+                    .window()
+                    .request_redraw();
+            }
+            Err(error) => eprintln!("Could not open SecretD access request: {error}"),
         }
     }
 
@@ -93,12 +124,25 @@ impl Runtime {
         event_loop.set_control_flow(ControlFlow::Wait);
     }
 
+    fn close_request_ui(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(ui) = self.request_ui.take() {
+            ui.destroy();
+        }
+        self.repaint_at = None;
+        event_loop.set_control_flow(ControlFlow::Wait);
+    }
+
     fn request_repaint(&mut self, event_loop: &ActiveEventLoop, delay: std::time::Duration) {
-        let Some(ui) = &self.ui else {
-            return;
-        };
         if delay.is_zero() {
-            ui.window().request_redraw();
+            if let Some(ui) = &self.ui {
+                ui.window().request_redraw();
+            }
+            if let Some(ui) = &self.request_ui {
+                ui.window().request_redraw();
+            }
+            return;
+        }
+        if self.ui.is_none() && self.request_ui.is_none() {
             return;
         }
         let Some(deadline) = Instant::now().checked_add(delay) else {
@@ -110,10 +154,14 @@ impl Runtime {
         }
     }
 
-    fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+    fn redraw_main(&mut self, event_loop: &ActiveEventLoop) {
         let (Some(app), Some(ui)) = (&mut self.app, &mut self.ui) else {
             return;
         };
+        if let Err(error) = ui.gl_window.make_current() {
+            eprintln!("Could not activate SecretD OpenGL context: {error}");
+            return;
+        }
         let mut quit = false;
         ui.egui.run(ui.gl_window.window(), |root_ui| {
             quit = app.ui(root_ui);
@@ -134,6 +182,42 @@ impl Runtime {
         }
         if quit {
             event_loop.exit();
+        }
+    }
+
+    fn redraw_request(&mut self, event_loop: &ActiveEventLoop) {
+        let action = {
+            let (Some(app), Some(ui)) = (&mut self.app, &mut self.request_ui) else {
+                return;
+            };
+            if let Err(error) = ui.gl_window.make_current() {
+                eprintln!("Could not activate SecretD request OpenGL context: {error}");
+                return;
+            }
+            let mut action = RequestDialogAction::None;
+            ui.egui.run(ui.gl_window.window(), |root_ui| {
+                action = app.request_dialog_ui(root_ui);
+            });
+            let clear = background_color();
+            unsafe {
+                ui.gl.clear_color(clear[0], clear[1], clear[2], clear[3]);
+                ui.gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+            ui.egui.paint(ui.gl_window.window());
+            if let Err(error) = ui.gl_window.swap_buffers() {
+                eprintln!("Could not present SecretD access request: {error}");
+            }
+            if !ui.shown {
+                ui.gl_window.window().set_visible(true);
+                ui.gl_window.window().focus_window();
+                ui.shown = true;
+            }
+            action
+        };
+        match action {
+            RequestDialogAction::None => {}
+            RequestDialogAction::Close => self.close_request_ui(event_loop),
+            RequestDialogAction::OpenMain => self.open_ui(event_loop),
         }
     }
 }
@@ -173,13 +257,18 @@ impl ApplicationHandler<AppEvent> for Runtime {
                 }
             }
             AppEvent::StateChanged => {
-                let pending = if let Some(app) = &mut self.app {
+                let (access_requests, login_in_progress) = if let Some(app) = &mut self.app {
                     app.refresh_state();
-                    app.has_pending()
+                    (app.has_access_requests(), app.aws_login_in_progress())
                 } else {
-                    false
+                    (false, false)
                 };
-                if pending {
+                if access_requests {
+                    self.open_request_ui(event_loop);
+                } else if self.request_ui.is_some() {
+                    self.close_request_ui(event_loop);
+                }
+                if login_in_progress {
                     self.open_ui(event_loop);
                 } else if let Some(ui) = &self.ui {
                     ui.window().request_redraw();
@@ -196,6 +285,9 @@ impl ApplicationHandler<AppEvent> for Runtime {
             if let Some(ui) = &self.ui {
                 ui.window().request_redraw();
             }
+            if let Some(ui) = &self.request_ui {
+                ui.window().request_redraw();
+            }
         }
     }
 
@@ -205,23 +297,52 @@ impl ApplicationHandler<AppEvent> for Runtime {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        if self
+        let is_main = self
             .ui
             .as_ref()
-            .is_none_or(|ui| ui.window().id() != window_id)
-        {
+            .is_some_and(|ui| ui.window().id() == window_id);
+        let is_request = self
+            .request_ui
+            .as_ref()
+            .is_some_and(|ui| ui.window().id() == window_id);
+        if !is_main && !is_request {
             return;
         }
-        if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
+        if is_request && matches!(event, WindowEvent::CloseRequested) {
+            if let Some(app) = &mut self.app {
+                app.deny_oldest_request();
+            }
+            self.close_request_ui(event_loop);
+            return;
+        }
+        if is_request && matches!(event, WindowEvent::Destroyed) {
+            self.request_ui = None;
+            return;
+        }
+        if is_main && matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
             self.close_ui(event_loop);
             return;
         }
         if matches!(event, WindowEvent::RedrawRequested) {
-            self.redraw(event_loop);
+            if is_request {
+                self.redraw_request(event_loop);
+            } else {
+                self.redraw_main(event_loop);
+            }
             return;
         }
-        let ui = self.ui.as_mut().expect("window event requires an open UI");
+        let ui = if is_request {
+            self.request_ui
+                .as_mut()
+                .expect("request window event requires an open UI")
+        } else {
+            self.ui.as_mut().expect("window event requires an open UI")
+        };
         if let WindowEvent::Resized(size) = &event {
+            if let Err(error) = ui.gl_window.make_current() {
+                eprintln!("Could not activate resized SecretD window: {error}");
+                return;
+            }
             ui.gl_window.resize(*size);
         }
         let response = ui.egui.on_window_event(ui.gl_window.window(), &event);
@@ -231,11 +352,15 @@ impl ApplicationHandler<AppEvent> for Runtime {
     }
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        self.close_request_ui(event_loop);
         self.close_ui(event_loop);
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(ui) = self.ui.take() {
+            ui.destroy();
+        }
+        if let Some(ui) = self.request_ui.take() {
             ui.destroy();
         }
         if let Some(app) = &mut self.app {
@@ -257,8 +382,9 @@ impl UiRuntime {
     fn new(
         event_loop: &ActiveEventLoop,
         event_proxy: EventLoopProxy<AppEvent>,
+        kind: WindowKind,
     ) -> Result<Self, Box<dyn Error>> {
-        let gl_window = unsafe { GlutinWindowContext::new(event_loop)? };
+        let gl_window = unsafe { GlutinWindowContext::new(event_loop, kind)? };
         let gl = Arc::new(unsafe {
             glow::Context::from_loader_function(|name| {
                 let name =
@@ -284,6 +410,9 @@ impl UiRuntime {
     }
 
     fn destroy(mut self) {
+        if let Err(error) = self.gl_window.make_current() {
+            eprintln!("Could not activate SecretD OpenGL context for cleanup: {error}");
+        }
         self.egui.destroy();
         unsafe {
             self.gl.finish();
@@ -302,13 +431,23 @@ struct GlutinWindowContext {
 }
 
 impl GlutinWindowContext {
-    unsafe fn new(event_loop: &ActiveEventLoop) -> Result<Self, Box<dyn Error>> {
-        let window_attributes = WindowAttributes::default()
-            .with_resizable(true)
-            .with_inner_size(LogicalSize::new(1040.0, 700.0))
-            .with_min_inner_size(LogicalSize::new(720.0, 520.0))
-            .with_title("SecretD")
-            .with_visible(false);
+    unsafe fn new(event_loop: &ActiveEventLoop, kind: WindowKind) -> Result<Self, Box<dyn Error>> {
+        let window_attributes = match kind {
+            WindowKind::Main => WindowAttributes::default()
+                .with_resizable(true)
+                .with_inner_size(LogicalSize::new(MAIN_WINDOW_SIZE.0, MAIN_WINDOW_SIZE.1))
+                .with_min_inner_size(LogicalSize::new(720.0, 520.0))
+                .with_title("SecretD"),
+            WindowKind::Request => WindowAttributes::default()
+                .with_resizable(false)
+                .with_inner_size(LogicalSize::new(
+                    REQUEST_WINDOW_SIZE.0,
+                    REQUEST_WINDOW_SIZE.1,
+                ))
+                .with_title("SecretD Access Request")
+                .with_window_level(WindowLevel::AlwaysOnTop),
+        }
+        .with_visible(false);
         let config_template = ConfigTemplateBuilder::new()
             .prefer_hardware_accelerated(None)
             .with_depth_size(0)
@@ -373,6 +512,10 @@ impl GlutinWindowContext {
         self.gl_surface.swap_buffers(&self.gl_context)
     }
 
+    fn make_current(&self) -> glutin::error::Result<()> {
+        self.gl_context.make_current(&self.gl_surface)
+    }
+
     fn get_proc_address(&self, name: &CStr) -> *const c_void {
         self.gl_display.get_proc_address(name)
     }
@@ -400,4 +543,15 @@ fn center_window(window: &Window) {
     let y =
         monitor_position.y + (monitor_size.height.saturating_sub(window_size.height) / 2) as i32;
     window.set_outer_position(PhysicalPosition::new(x, y));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAIN_WINDOW_SIZE, REQUEST_WINDOW_SIZE};
+
+    #[test]
+    fn request_window_is_compact_relative_to_the_main_window() {
+        assert!(REQUEST_WINDOW_SIZE.0 < MAIN_WINDOW_SIZE.0);
+        assert!(REQUEST_WINDOW_SIZE.1 < MAIN_WINDOW_SIZE.1);
+    }
 }
