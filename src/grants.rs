@@ -5,26 +5,12 @@ use uuid::Uuid;
 use crate::process::{ProcessIdentity, same_process};
 
 pub const MAX_GRANT_SECONDS: u64 = 60 * 60;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GrantScope {
-    Secret,
-    Group,
-}
-
-impl GrantScope {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Secret => "secret",
-            Self::Group => "group",
-        }
-    }
-}
+pub const DEFAULT_GRANT_SECONDS: u64 = 30 * 60;
+pub const GRANT_EXTENSION_SECONDS: u64 = 15 * 60;
 
 #[derive(Clone, Debug)]
 pub struct Grant {
     pub id: String,
-    pub scope: GrantScope,
     pub resource: String,
     pub process: ProcessIdentity,
     pub created_at: u64,
@@ -39,7 +25,6 @@ pub struct GrantStore {
 impl GrantStore {
     pub fn add(
         &mut self,
-        scope: GrantScope,
         resource: String,
         process: ProcessIdentity,
         seconds: u64,
@@ -52,7 +37,6 @@ impl GrantStore {
         let now = now_millis();
         let grant = Grant {
             id: Uuid::new_v4().to_string(),
-            scope,
             resource,
             process,
             created_at: now,
@@ -62,24 +46,13 @@ impl GrantStore {
         Ok(grant)
     }
 
-    pub fn find(
-        &mut self,
-        secret: &str,
-        group: Option<&str>,
-        process_tree: &[ProcessIdentity],
-    ) -> Option<Grant> {
+    pub fn find(&mut self, secret: &str, process_tree: &[ProcessIdentity]) -> Option<Grant> {
         self.cleanup();
         process_tree.iter().find_map(|process| {
             self.grants
                 .iter()
                 .rev()
-                .find(|grant| {
-                    let resource_matches = match grant.scope {
-                        GrantScope::Secret => grant.resource == secret,
-                        GrantScope::Group => group.is_some_and(|group| grant.resource == group),
-                    };
-                    resource_matches && same_process(&grant.process, process)
-                })
+                .find(|grant| grant.resource == secret && same_process(&grant.process, process))
                 .cloned()
         })
     }
@@ -94,6 +67,17 @@ impl GrantStore {
     pub fn revoke(&mut self, id: &str) -> Option<Grant> {
         let index = self.grants.iter().position(|grant| grant.id == id)?;
         Some(self.grants.remove(index))
+    }
+
+    pub fn extend(&mut self, id: &str) -> Option<Grant> {
+        self.cleanup();
+        let now = now_millis();
+        let grant = self.grants.iter_mut().find(|grant| grant.id == id)?;
+        grant.expires_at = grant
+            .expires_at
+            .saturating_add(GRANT_EXTENSION_SECONDS.saturating_mul(1_000))
+            .min(now.saturating_add(MAX_GRANT_SECONDS.saturating_mul(1_000)));
+        Some(grant.clone())
     }
 
     fn cleanup(&mut self) {
@@ -126,21 +110,11 @@ mod tests {
     }
 
     #[test]
-    fn matches_secret_and_group_scopes() {
+    fn matches_a_secret() {
         let mut grants = GrantStore::default();
-        grants
-            .add(GrantScope::Group, "aws-read-only".into(), process(), 30)
-            .unwrap();
-        assert!(
-            grants
-                .find("aws/key", Some("aws-read-only"), &[process()])
-                .is_some()
-        );
-        assert!(
-            grants
-                .find("aws/key", Some("aws-admin"), &[process()])
-                .is_none()
-        );
+        grants.add("aws/key".into(), process(), 30).unwrap();
+        assert!(grants.find("aws/key", &[process()]).is_some());
+        assert!(grants.find("aws/other", &[process()]).is_none());
     }
 
     #[test]
@@ -152,10 +126,23 @@ mod tests {
         child.started_at = "child-start".into();
         child.executable = "/bin/child".into();
         let mut grants = GrantStore::default();
-        grants
-            .add(GrantScope::Secret, "token".into(), ancestor.clone(), 30)
-            .unwrap();
+        grants.add("token".into(), ancestor.clone(), 30).unwrap();
 
-        assert!(grants.find("token", None, &[child, ancestor]).is_some());
+        assert!(grants.find("token", &[child, ancestor]).is_some());
+    }
+
+    #[test]
+    fn extensions_add_fifteen_minutes_and_cap_remaining_time_at_one_hour() {
+        let mut grants = GrantStore::default();
+        let grant = grants
+            .add("token".into(), process(), DEFAULT_GRANT_SECONDS)
+            .unwrap();
+        let first = grants.extend(&grant.id).unwrap();
+        let second = grants.extend(&grant.id).unwrap();
+        let third = grants.extend(&grant.id).unwrap();
+
+        assert_eq!(first.expires_at, grant.expires_at + 15 * 60 * 1_000);
+        assert_eq!(second.expires_at, grant.expires_at + 30 * 60 * 1_000);
+        assert!(third.expires_at <= now_millis() + MAX_GRANT_SECONDS * 1_000);
     }
 }

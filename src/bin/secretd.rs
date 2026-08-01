@@ -92,7 +92,7 @@ fn mode(arguments: &[String]) -> Result<Mode, ()> {
 
 fn launch_desktop(arguments: &[String]) -> Result<(), String> {
     let executable = std::env::current_exe()
-        .map_err(|error| format!("could not locate the SecretD executable: {error}"))?;
+        .map_err(|error| format!("could not locate the secretd executable: {error}"))?;
     let mut command = Command::new(executable);
     command
         .arg("desktop")

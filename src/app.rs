@@ -22,7 +22,7 @@ use secretd::{
         AppSnapshot, ApprovalDecision, AuditAction, Controller, PendingAwsCredentialRequest,
         PendingRequest,
     },
-    grants::GrantScope,
+    grants::DEFAULT_GRANT_SECONDS,
     ipc::{RequestServer, begin_aws_login},
     paths::{default_runtime_path, default_vault_path},
     process::{ProcessIdentity, is_launchd_process, same_process},
@@ -71,7 +71,6 @@ enum View {
 struct SecretDraft {
     original_name: Option<String>,
     name: String,
-    group: String,
     value: Zeroizing<String>,
 }
 
@@ -128,7 +127,6 @@ pub struct SecretDApp {
     auth_error: Option<String>,
     auth_focus_requested: bool,
     search: String,
-    group_filter: Option<String>,
     secret_draft: Option<SecretDraft>,
     password_draft: Option<PasswordDraft>,
     aws_draft: Option<AwsDraft>,
@@ -160,7 +158,7 @@ impl SecretDApp {
         .map_err(std::io::Error::other)?;
         let snapshot = controller
             .lock()
-            .map_err(|_| std::io::Error::other("SecretD state is unavailable"))?
+            .map_err(|_| std::io::Error::other("secretd state is unavailable"))?
             .snapshot();
         let tray_menu = Menu::new();
         rebuild_tray_menu(&tray_menu, &snapshot)?;
@@ -169,7 +167,7 @@ impl SecretDApp {
             .with_menu(Box::new(tray_menu.clone()))
             .with_icon(tray_icon(tray_status).map_err(std::io::Error::other)?)
             .with_icon_as_template(false)
-            .with_tooltip("SecretD")
+            .with_tooltip("secretd")
             .with_menu_on_left_click(false)
             .build()?;
 
@@ -210,7 +208,6 @@ impl SecretDApp {
             auth_error: None,
             auth_focus_requested: false,
             search: String::new(),
-            group_filter: None,
             secret_draft: None,
             password_draft: None,
             aws_draft: None,
@@ -305,7 +302,7 @@ impl SecretDApp {
     fn snapshot(&self) -> AppSnapshot {
         self.controller
             .lock()
-            .expect("SecretD controller mutex was poisoned")
+            .expect("secretd controller mutex was poisoned")
             .snapshot()
     }
 
@@ -320,17 +317,17 @@ impl SecretDApp {
         let pending_count = snapshot.pending.len() + snapshot.pending_aws.len();
         let tooltip = if pending_count > 0 {
             format!(
-                "SecretD — {} request{} pending",
+                "secretd — {} request{} pending",
                 pending_count,
                 if pending_count == 1 { "" } else { "s" }
             )
         } else if snapshot.unlocked {
             format!(
-                "SecretD — unlocked · {} credentials",
+                "secretd — unlocked · {} credentials",
                 snapshot.secrets.len()
             )
         } else {
-            "SecretD — locked".into()
+            "secretd — locked".into()
         };
         let _ = self.tray.set_tooltip(Some(tooltip));
         let _ = rebuild_tray_menu(&self.tray_menu, snapshot);
@@ -354,7 +351,7 @@ impl SecretDApp {
                                 brand_mark(ui);
                                 ui.vertical(|ui| {
                                     ui.label(
-                                        RichText::new("SecretD")
+                                        RichText::new("secretd")
                                             .size(17.0)
                                             .strong()
                                             .color(INK),
@@ -463,7 +460,7 @@ impl SecretDApp {
         let result = self
             .controller
             .lock()
-            .map_err(|_| "SecretD state is unavailable".to_string())
+            .map_err(|_| "secretd state is unavailable".to_string())
             .and_then(|mut controller| {
                 if creating {
                     controller
@@ -495,7 +492,7 @@ impl SecretDApp {
                 ui.horizontal(|ui| {
                     brand_mark(ui);
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("SecretD").size(18.0).strong().color(INK));
+                        ui.label(RichText::new("secretd").size(18.0).strong().color(INK));
                         ui.label(RichText::new("Local credential vault").small().color(MUTED));
                     });
                     status_pill(ui, "Vault unlocked", GREEN, GREEN_SOFT);
@@ -565,35 +562,15 @@ impl SecretDApp {
         section_header(
             ui,
             "Credentials",
-            "Manage secrets and organize related access with groups.",
+            "Manage encrypted credentials stored in your local vault.",
         );
         ui.horizontal(|ui| {
-            singleline_field(
-                ui,
-                &mut self.search,
-                "Search credentials or groups…",
-                false,
-                310.0,
-            );
-            let groups: Vec<_> = snapshot
-                .secrets
-                .iter()
-                .filter_map(|secret| secret.group.clone())
-                .collect();
-            egui::ComboBox::from_id_salt("group-filter")
-                .selected_text(self.group_filter.as_deref().unwrap_or("All groups"))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.group_filter, None, "All groups");
-                    for group in groups {
-                        ui.selectable_value(&mut self.group_filter, Some(group.clone()), group);
-                    }
-                });
+            singleline_field(ui, &mut self.search, "Search credentials…", false, 310.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if primary_button(ui, "+ New credential").clicked() {
                     self.secret_draft = Some(SecretDraft {
                         original_name: None,
                         name: String::new(),
-                        group: String::new(),
                         value: Zeroizing::new(String::new()),
                     });
                     self.form_error = None;
@@ -606,18 +583,7 @@ impl SecretDApp {
         let visible: Vec<_> = snapshot
             .secrets
             .iter()
-            .filter(|secret| {
-                (query.is_empty()
-                    || secret.name.to_ascii_lowercase().contains(&query)
-                    || secret
-                        .group
-                        .as_deref()
-                        .is_some_and(|group| group.to_ascii_lowercase().contains(&query)))
-                    && self
-                        .group_filter
-                        .as_deref()
-                        .is_none_or(|group| secret.group.as_deref() == Some(group))
-            })
+            .filter(|secret| query.is_empty() || secret.name.to_ascii_lowercase().contains(&query))
             .cloned()
             .collect();
         if visible.is_empty() {
@@ -644,14 +610,7 @@ impl SecretDApp {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         credential_mark(ui);
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(&secret.name).size(14.0).strong().color(INK));
-                            ui.label(
-                                RichText::new(secret.group.as_deref().unwrap_or("No group"))
-                                    .small()
-                                    .color(MUTED),
-                            );
-                        });
+                        ui.label(RichText::new(&secret.name).size(14.0).strong().color(INK));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if danger_button(ui, "Delete").clicked() {
                                 delete = Some(secret.name.clone());
@@ -704,7 +663,7 @@ impl SecretDApp {
                 match self
                     .controller
                     .lock()
-                    .map_err(|_| "SecretD state is unavailable".to_string())
+                    .map_err(|_| "secretd state is unavailable".to_string())
                     .and_then(|controller| {
                         controller
                             .reveal_secret(&name)
@@ -719,7 +678,7 @@ impl SecretDApp {
             let result = self
                 .controller
                 .lock()
-                .map_err(|_| "SecretD state is unavailable".to_string())
+                .map_err(|_| "secretd state is unavailable".to_string())
                 .and_then(|controller| {
                     controller
                         .reveal_secret(&name)
@@ -727,16 +686,9 @@ impl SecretDApp {
                 });
             match result {
                 Ok(value) => {
-                    let group = snapshot
-                        .secrets
-                        .iter()
-                        .find(|secret| secret.name == name)
-                        .and_then(|secret| secret.group.clone())
-                        .unwrap_or_default();
                     self.secret_draft = Some(SecretDraft {
                         original_name: Some(name.clone()),
                         name,
-                        group,
                         value,
                     });
                     self.form_error = None;
@@ -897,7 +849,7 @@ impl SecretDApp {
                     ui.label(RichText::new("Step 2 · Discover your accounts").strong());
                     ui.label(
                         RichText::new(
-                            "Sign in to AWS. SecretD will load the accounts and roles assigned to you.",
+                            "Sign in to AWS. secretd will load the accounts and roles assigned to you.",
                         )
                         .small()
                         .color(MUTED),
@@ -1020,6 +972,11 @@ impl SecretDApp {
                                 .pending_aws
                                 .first()
                                 .expect("AWS request was selected");
+                            self.request_choices.entry(request.id.clone()).or_insert(
+                                RequestChoice {
+                                    seconds: DEFAULT_GRANT_SECONDS,
+                                },
+                            );
                             let mut grant_process = self
                                 .grant_process_choices
                                 .get(&request.id)
@@ -1043,29 +1000,39 @@ impl SecretDApp {
                                         request.verified,
                                     );
                                     ui.add_space(8.0);
+                                    if snapshot.unlocked && request.verified {
+                                        let choice =
+                                            self.request_choices.get_mut(&request.id).unwrap();
+                                        grant_duration_picker(ui, &request.id, choice);
+                                        ui.add_space(8.0);
+                                    }
                                     ui.horizontal_wrapped(|ui| {
                                         if danger_button(ui, "Deny").clicked() {
-                                            aws_response = Some((request.id.clone(), None, None));
+                                            aws_response =
+                                                Some((request.id.clone(), None, None, None));
                                         }
                                         if snapshot.unlocked {
-                                            if secondary_button(ui, "Grant read-only credentials")
-                                                .clicked()
-                                            {
+                                            let seconds = self
+                                                .request_choices
+                                                .get(&request.id)
+                                                .map(|choice| choice.seconds);
+                                            if secondary_button(ui, "Grant read-only").clicked() {
                                                 aws_response = Some((
                                                     request.id.clone(),
                                                     Some(AwsAccessLevel::ReadOnly),
                                                     grant_process.clone(),
+                                                    seconds,
                                                 ));
                                             }
-                                            if admin_button(ui, "Grant admin credentials").clicked()
-                                            {
+                                            if admin_button(ui, "Grant admin").clicked() {
                                                 aws_response = Some((
                                                     request.id.clone(),
                                                     Some(AwsAccessLevel::Admin),
                                                     grant_process.clone(),
+                                                    seconds,
                                                 ));
                                             }
-                                        } else if primary_button(ui, "Open SecretD to unlock")
+                                        } else if primary_button(ui, "Open secretd to unlock")
                                             .clicked()
                                         {
                                             action = RequestDialogAction::OpenMain;
@@ -1081,9 +1048,11 @@ impl SecretDApp {
                                 .pending
                                 .first()
                                 .expect("secret request was selected");
-                            self.request_choices
-                                .entry(request.id.clone())
-                                .or_insert(RequestChoice { seconds: 300 });
+                            self.request_choices.entry(request.id.clone()).or_insert(
+                                RequestChoice {
+                                    seconds: DEFAULT_GRANT_SECONDS,
+                                },
+                            );
                             let mut grant_process = self
                                 .grant_process_choices
                                 .get(&request.id)
@@ -1107,13 +1076,18 @@ impl SecretDApp {
                                         request.verified,
                                     );
                                     ui.add_space(8.0);
+                                    if snapshot.unlocked && request.verified {
+                                        let choice =
+                                            self.request_choices.get_mut(&request.id).unwrap();
+                                        grant_duration_picker(ui, &request.id, choice);
+                                        ui.add_space(8.0);
+                                    }
                                     ui.horizontal_wrapped(|ui| {
                                         if danger_button(ui, "Deny").clicked() {
                                             response = Some((
                                                 request.id.clone(),
                                                 ApprovalDecision::Deny,
                                                 None,
-                                                GrantScope::Secret,
                                                 None,
                                             ));
                                         }
@@ -1124,53 +1098,24 @@ impl SecretDApp {
                                                 request.id.clone(),
                                                 ApprovalDecision::Once,
                                                 None,
-                                                GrantScope::Secret,
                                                 None,
                                             ));
                                         }
                                         if snapshot.unlocked && request.verified {
-                                            let choice =
-                                                self.request_choices.get_mut(&request.id).unwrap();
-                                            egui::ComboBox::from_id_salt(format!(
-                                                "ttl-{}",
-                                                request.id
-                                            ))
-                                            .selected_text(duration_label(choice.seconds))
-                                            .show_ui(
-                                                ui,
-                                                |ui| {
-                                                    for seconds in [60, 300, 900, 3600] {
-                                                        ui.selectable_value(
-                                                            &mut choice.seconds,
-                                                            seconds,
-                                                            duration_label(seconds),
-                                                        );
-                                                    }
-                                                },
-                                            );
-                                            if primary_button(ui, "Grant this secret").clicked() {
+                                            let seconds = self
+                                                .request_choices
+                                                .get(&request.id)
+                                                .map(|choice| choice.seconds);
+                                            if primary_button(ui, "Grant access").clicked() {
                                                 response = Some((
                                                     request.id.clone(),
                                                     ApprovalDecision::Temporary,
-                                                    Some(choice.seconds),
-                                                    GrantScope::Secret,
+                                                    seconds,
                                                     grant_process.clone(),
                                                 ));
                                             }
-                                            if let Some(group) = &request.group {
-                                                let label = group_grant_label(group);
-                                                if primary_button(ui, &label).clicked() {
-                                                    response = Some((
-                                                        request.id.clone(),
-                                                        ApprovalDecision::Temporary,
-                                                        Some(choice.seconds),
-                                                        GrantScope::Group,
-                                                        grant_process.clone(),
-                                                    ));
-                                                }
-                                            }
                                         } else if !snapshot.unlocked
-                                            && primary_button(ui, "Open SecretD to unlock")
+                                            && primary_button(ui, "Open secretd to unlock")
                                                 .clicked()
                                         {
                                             action = RequestDialogAction::OpenMain;
@@ -1184,14 +1129,14 @@ impl SecretDApp {
                         }
                     });
             });
-        if let Some((id, decision, seconds, scope, grant_process)) = response {
+        if let Some((id, decision, seconds, grant_process)) = response {
             let result = self
                 .controller
                 .lock()
-                .map_err(|_| "SecretD state is unavailable".to_string())
+                .map_err(|_| "secretd state is unavailable".to_string())
                 .and_then(|mut controller| {
                     controller
-                        .respond(&id, decision, seconds, scope, grant_process)
+                        .respond(&id, decision, seconds, grant_process)
                         .map_err(|error| error.to_string())
                 });
             match result {
@@ -1205,14 +1150,14 @@ impl SecretDApp {
             self.grant_process_choices.remove(&id);
             self.refresh_state();
         }
-        if let Some((id, level, grant_process)) = aws_response {
+        if let Some((id, level, grant_process, seconds)) = aws_response {
             let result = self
                 .controller
                 .lock()
-                .map_err(|_| "SecretD state is unavailable".to_string())
+                .map_err(|_| "secretd state is unavailable".to_string())
                 .and_then(|mut controller| {
                     controller
-                        .respond_aws(&id, level, grant_process)
+                        .respond_aws(&id, level, grant_process, seconds)
                         .map_err(|error| error.to_string())
                 });
             match result {
@@ -1222,6 +1167,7 @@ impl SecretDApp {
                 }
                 Err(error) => self.request_error = Some(error),
             }
+            self.request_choices.remove(&id);
             self.grant_process_choices.remove(&id);
             self.refresh_state();
         }
@@ -1239,19 +1185,14 @@ impl SecretDApp {
             if let Some(request) = snapshot.pending_aws.first()
                 && let Ok(mut controller) = self.controller.lock()
             {
-                let _ = controller.respond_aws(&request.id, None, None);
+                let _ = controller.respond_aws(&request.id, None, None, None);
+                self.request_choices.remove(&request.id);
                 self.grant_process_choices.remove(&request.id);
             }
         } else if let Some(request) = snapshot.pending.first()
             && let Ok(mut controller) = self.controller.lock()
         {
-            let _ = controller.respond(
-                &request.id,
-                ApprovalDecision::Deny,
-                None,
-                GrantScope::Secret,
-                None,
-            );
+            let _ = controller.respond(&request.id, ApprovalDecision::Deny, None, None);
             self.request_choices.remove(&request.id);
             self.grant_process_choices.remove(&request.id);
         }
@@ -1263,7 +1204,7 @@ impl SecretDApp {
         section_header(
             ui,
             "Active access",
-            "Grants follow the selected process and its children. All grants disappear when SecretD exits or the vault locks.",
+            "Grants follow the selected process and its children for at most 60 minutes at a time.",
         );
         if snapshot.grants.is_empty() && snapshot.aws_grants.is_empty() {
             empty_state(ui, "No active grants");
@@ -1271,6 +1212,8 @@ impl SecretDApp {
         }
         let mut revoke = None;
         let mut revoke_aws = None;
+        let mut extend = None;
+        let mut extend_aws = None;
         for grant in &snapshot.aws_grants {
             Frame::new()
                 .fill(SURFACE)
@@ -1293,8 +1236,10 @@ impl SecretDApp {
                             );
                             ui.label(
                                 RichText::new(format!(
-                                    "{} · PID {} · active for this process and its children",
-                                    grant.process.executable, grant.process.pid
+                                    "{} · PID {} · expires in {}",
+                                    grant.process.executable,
+                                    grant.process.pid,
+                                    duration_until(grant.expires_at)
                                 ))
                                 .small()
                                 .color(MUTED),
@@ -1303,6 +1248,9 @@ impl SecretDApp {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if danger_button(ui, "Revoke").clicked() {
                                 revoke_aws = Some(grant.id.clone());
+                            }
+                            if secondary_button(ui, "+15 min").clicked() {
+                                extend_aws = Some(grant.id.clone());
                             }
                         });
                     });
@@ -1318,14 +1266,7 @@ impl SecretDApp {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} · {}",
-                                    grant.resource,
-                                    grant.scope.label()
-                                ))
-                                .strong(),
-                            );
+                            ui.label(RichText::new(&grant.resource).strong());
                             ui.label(
                                 RichText::new(format!(
                                     "{} · PID {} · expires in {}",
@@ -1340,6 +1281,9 @@ impl SecretDApp {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if danger_button(ui, "Revoke").clicked() {
                                 revoke = Some(grant.id.clone());
+                            }
+                            if secondary_button(ui, "+15 min").clicked() {
+                                extend = Some(grant.id.clone());
                             }
                         });
                     });
@@ -1358,13 +1302,25 @@ impl SecretDApp {
             }
             self.refresh_state();
         }
+        if let Some(id) = extend {
+            if let Ok(mut controller) = self.controller.lock() {
+                controller.extend_grant(&id);
+            }
+            self.refresh_state();
+        }
+        if let Some(id) = extend_aws {
+            if let Ok(mut controller) = self.controller.lock() {
+                controller.extend_aws_grant(&id);
+            }
+            self.refresh_state();
+        }
     }
 
     fn activity_ui(&mut self, ui: &mut egui::Ui, snapshot: &AppSnapshot) {
         section_header(
             ui,
             "Activity",
-            "A memory-only record that is cleared when SecretD exits.",
+            "A memory-only record that is cleared when secretd exits.",
         );
         if snapshot.audit.is_empty() {
             empty_state(ui, "No activity yet");
@@ -1384,16 +1340,6 @@ impl SecretDApp {
                                 .color(audit_color(entry.action)),
                         );
                         ui.label(RichText::new(&entry.secret).monospace().color(INK));
-                        if let Some(resource) = &entry.resource {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} · {resource}",
-                                    entry.scope.map_or("", GrantScope::label)
-                                ))
-                                .small()
-                                .color(MUTED),
-                            );
-                        }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(
                                 RichText::new(duration_since(entry.occurred_at))
@@ -1439,8 +1385,6 @@ impl SecretDApp {
                 false,
                 f32::INFINITY,
             );
-            field_label(ui, "Group (optional)");
-            singleline_field(ui, &mut draft.group, "aws-read-only", false, f32::INFINITY);
             field_label(ui, "Value");
             ui.add(
                 TextEdit::multiline(&mut *draft.value)
@@ -1464,15 +1408,10 @@ impl SecretDApp {
             let result = self
                 .controller
                 .lock()
-                .map_err(|_| "SecretD state is unavailable".to_string())
+                .map_err(|_| "secretd state is unavailable".to_string())
                 .and_then(|mut controller| {
                     controller
-                        .save_secret(
-                            &draft.name,
-                            &draft.value,
-                            draft.original_name.as_deref(),
-                            Some(&draft.group),
-                        )
+                        .save_secret(&draft.name, &draft.value, draft.original_name.as_deref())
                         .map_err(|error| error.to_string())
                 });
             match result {
@@ -1538,7 +1477,7 @@ impl SecretDApp {
                         AwsDraftStep::Aliases => {
                             ui.label(
                                 RichText::new(
-                                    "Step 2 of 2 · Choose a local alias and the roles SecretD should offer for each discovered account. Clear an alias to omit that account.",
+                                    "Step 2 of 2 · Choose a local alias and the roles secretd should offer for each discovered account. Clear an alias to omit that account.",
                                 )
                                 .color(MUTED),
                             );
@@ -1710,7 +1649,7 @@ impl SecretDApp {
                 let result = self
                     .controller
                     .lock()
-                    .map_err(|_| "SecretD state is unavailable".to_string())
+                    .map_err(|_| "secretd state is unavailable".to_string())
                     .and_then(|mut controller| {
                         controller
                             .change_password(&draft.password)
@@ -1758,7 +1697,7 @@ impl SecretDApp {
             let result = self
                 .controller
                 .lock()
-                .map_err(|_| "SecretD state is unavailable".to_string())
+                .map_err(|_| "secretd state is unavailable".to_string())
                 .and_then(|mut controller| {
                     controller
                         .delete_secret(&name)
@@ -2139,16 +2078,13 @@ fn process_grant_selector(
                     if depth > 0 {
                         ui.label(RichText::new("└─").monospace().color(LINE_STRONG));
                     }
-                    let label = if process.command.trim().is_empty() {
-                        process.executable.as_str()
-                    } else {
-                        process.command.as_str()
-                    };
+                    let label = compact_process_label(process);
                     let radio = ui
                         .add_enabled_ui(verified, |ui| {
                             ui.radio(is_selected, RichText::new(label).monospace().color(INK))
                         })
-                        .inner;
+                        .inner
+                        .on_hover_text(process_details(process));
                     if radio.clicked() {
                         *selected = Some(process.clone());
                     }
@@ -2182,6 +2118,41 @@ fn process_grant_selector(
     }
 }
 
+fn compact_process_label(process: &ProcessIdentity) -> String {
+    let command = process.command.trim();
+    let source = if command.is_empty() {
+        process.executable.trim()
+    } else {
+        command
+    };
+    let mut parts = source.split_whitespace();
+    let executable = parts.next().unwrap_or(source);
+    let program = executable
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(executable);
+    let mut label = program.to_string();
+    for argument in parts.take(2) {
+        let argument = argument.rsplit('/').next().unwrap_or(argument);
+        if label.chars().count() + argument.chars().count() + 1 > 42 {
+            label.push_str(" …");
+            break;
+        }
+        label.push(' ');
+        label.push_str(argument);
+    }
+    label
+}
+
+fn process_details(process: &ProcessIdentity) -> String {
+    if process.command.trim().is_empty() || process.command == process.executable {
+        process.executable.clone()
+    } else {
+        format!("{}\n{}", process.executable, process.command)
+    }
+}
+
 fn request_heading(ui: &mut egui::Ui, request: &PendingRequest) {
     ui.horizontal(|ui| {
         ui.label(
@@ -2190,9 +2161,6 @@ fn request_heading(ui: &mut egui::Ui, request: &PendingRequest) {
                 .strong()
                 .color(INK),
         );
-        if let Some(group) = &request.group {
-            ui.label(RichText::new(group).small().color(GREEN));
-        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
                 RichText::new(if request.verified {
@@ -2363,7 +2331,7 @@ fn save_aws_connection(
 ) -> Result<(), String> {
     controller
         .lock()
-        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .map_err(|_| "secretd state is unavailable".to_string())?
         .save_aws_connection(
             draft.start_url.trim().to_string(),
             draft.sso_region.trim().to_string(),
@@ -2410,23 +2378,32 @@ fn save_aws_aliases(controller: &Arc<Mutex<Controller>>, draft: &AwsDraft) -> Re
     };
     controller
         .lock()
-        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .map_err(|_| "secretd state is unavailable".to_string())?
         .save_aws_configuration(configuration)
         .map_err(|error| error.to_string())
 }
 
 fn duration_label(seconds: u64) -> &'static str {
     match seconds {
-        60 => "1 minute",
         300 => "5 minutes",
         900 => "15 minutes",
+        1800 => "30 minutes",
         3600 => "1 hour",
         _ => "Temporary",
     }
 }
 
-fn group_grant_label(group: &str) -> String {
-    format!("Grant entire {group} group")
+fn grant_duration_picker(ui: &mut egui::Ui, request_id: &str, choice: &mut RequestChoice) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Grant for").small().strong().color(MUTED));
+        egui::ComboBox::from_id_salt(format!("ttl-{request_id}"))
+            .selected_text(duration_label(choice.seconds))
+            .show_ui(ui, |ui| {
+                for seconds in [300, 900, 1800, 3600] {
+                    ui.selectable_value(&mut choice.seconds, seconds, duration_label(seconds));
+                }
+            });
+    });
 }
 
 fn duration_until(timestamp: u64) -> String {
@@ -2512,7 +2489,7 @@ fn rebuild_tray_menu(menu: &Menu, snapshot: &AppSnapshot) -> tray_icon::menu::Re
         ))?;
         menu.append(&PredefinedMenuItem::separator())?;
     }
-    menu.append(&MenuItem::with_id("show", "Open SecretD", true, None))?;
+    menu.append(&MenuItem::with_id("show", "Open secretd", true, None))?;
     menu.append(&MenuItem::with_id(
         "lock",
         "Lock vault",
@@ -2520,7 +2497,7 @@ fn rebuild_tray_menu(menu: &Menu, snapshot: &AppSnapshot) -> tray_icon::menu::Re
         None,
     ))?;
     menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&MenuItem::with_id("quit", "Quit SecretD", true, None))?;
+    menu.append(&MenuItem::with_id("quit", "Quit secretd", true, None))?;
     Ok(())
 }
 
@@ -2563,11 +2540,6 @@ mod tests {
         assert!(auth_submission_requested(false, true, true));
         assert!(!auth_submission_requested(false, true, false));
         assert!(auth_submission_requested(true, false, true));
-    }
-
-    #[test]
-    fn group_grant_button_names_the_group() {
-        assert_eq!(group_grant_label("aws-to"), "Grant entire aws-to group");
     }
 
     #[test]
@@ -2620,5 +2592,22 @@ mod tests {
         let grantable = grantable_processes(&tree);
         assert_eq!(grantable, [&shell, &child]);
         assert_eq!(default_grant_process(&tree), Some(child));
+    }
+
+    #[test]
+    fn process_labels_are_compact_but_keep_useful_arguments() {
+        let process = ProcessIdentity {
+            pid: 42,
+            ppid: 1,
+            started_at: "start".into(),
+            executable: "/opt/homebrew/bin/terraform".into(),
+            command: "/opt/homebrew/bin/terraform plan /a/very/long/path/to/configuration".into(),
+        };
+
+        assert_eq!(
+            compact_process_label(&process),
+            "terraform plan configuration"
+        );
+        assert!(process_details(&process).contains("/opt/homebrew/bin/terraform"));
     }
 }

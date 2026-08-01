@@ -172,7 +172,7 @@ fn handle_connection(
             "aws-login" => {
                 begin_aws_login(Arc::clone(controller), Arc::clone(notify))?;
                 Ok(Zeroizing::new(
-                    "AWS SSO login started in the SecretD window".into(),
+                    "AWS SSO login started in the secretd window".into(),
                 ))
             }
             _ => Err("Invalid request".into()),
@@ -211,7 +211,7 @@ fn handle_secret_request(
     let (verified, tree) = request_process(pid, connection)?;
     let outcome = controller
         .lock()
-        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .map_err(|_| "secretd state is unavailable".to_string())?
         .begin_request(secret, tree, verified)
         .map_err(|error| error.to_string())?;
     match outcome {
@@ -222,7 +222,7 @@ fn handle_secret_request(
                 Ok(RequestResolution::Approved) => {
                     let value = controller
                         .lock()
-                        .map_err(|_| "SecretD state is unavailable".to_string())?
+                        .map_err(|_| "secretd state is unavailable".to_string())?
                         .release_after_approval(secret)
                         .map_err(|error| error.to_string());
                     notify();
@@ -258,7 +258,7 @@ fn handle_aws_request(
     let (verified, tree) = request_process(pid, connection)?;
     let outcome = controller
         .lock()
-        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .map_err(|_| "secretd state is unavailable".to_string())?
         .begin_aws_request(profile, tree, verified)
         .map_err(|error| error.to_string())?;
     let level = match outcome {
@@ -283,7 +283,7 @@ fn handle_aws_request(
     };
     let (broker, _) = controller
         .lock()
-        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .map_err(|_| "secretd state is unavailable".to_string())?
         .aws_credential_context()
         .map_err(|error| error.to_string())?;
     let _operation = broker.operation()?;
@@ -291,13 +291,13 @@ fn handle_aws_request(
     // credential helper may have completed the shared login while this one waited.
     let (_, mut settings) = controller
         .lock()
-        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .map_err(|_| "secretd state is unavailable".to_string())?
         .aws_credential_context()
         .map_err(|error| error.to_string())?;
     let first_attempt = broker.credentials(&mut settings, profile, level);
     controller
         .lock()
-        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .map_err(|_| "secretd state is unavailable".to_string())?
         .persist_aws_settings(&settings)
         .map_err(|error| error.to_string())?;
     let credentials = match first_attempt {
@@ -305,7 +305,7 @@ fn handle_aws_request(
         Err(error) if is_session_expired_error(&error) => {
             let (_, login_settings) = controller
                 .lock()
-                .map_err(|_| "SecretD state is unavailable".to_string())?
+                .map_err(|_| "secretd state is unavailable".to_string())?
                 .prepare_aws_login()
                 .map_err(|error| error.to_string())?;
             notify();
@@ -317,13 +317,13 @@ fn handle_aws_request(
             )?;
             let (_, mut refreshed_settings) = controller
                 .lock()
-                .map_err(|_| "SecretD state is unavailable".to_string())?
+                .map_err(|_| "secretd state is unavailable".to_string())?
                 .aws_credential_context()
                 .map_err(|error| error.to_string())?;
             let credentials = broker.credentials(&mut refreshed_settings, profile, level);
             controller
                 .lock()
-                .map_err(|_| "SecretD state is unavailable".to_string())?
+                .map_err(|_| "secretd state is unavailable".to_string())?
                 .persist_aws_settings(&refreshed_settings)
                 .map_err(|error| error.to_string())?;
             credentials?
@@ -342,7 +342,7 @@ pub fn begin_aws_login(
 ) -> Result<(), String> {
     let (broker, initial_settings) = controller
         .lock()
-        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .map_err(|_| "secretd state is unavailable".to_string())?
         .preview_aws_login()
         .map_err(|error| error.to_string())?;
     let initial_expiration = initial_settings
@@ -357,7 +357,7 @@ pub fn begin_aws_login(
             let result = broker.operation().and_then(|_operation| {
                 let current_expiration = login_controller
                     .lock()
-                    .map_err(|_| "SecretD state is unavailable".to_string())?
+                    .map_err(|_| "secretd state is unavailable".to_string())?
                     .aws_credential_context()
                     .map_err(|error| error.to_string())?
                     .1
@@ -370,7 +370,7 @@ pub fn begin_aws_login(
                 }
                 let (_, settings) = login_controller
                     .lock()
-                    .map_err(|_| "SecretD state is unavailable".to_string())?
+                    .map_err(|_| "secretd state is unavailable".to_string())?
                     .prepare_aws_login()
                     .map_err(|error| error.to_string())?;
                 login_notify();
@@ -427,13 +427,13 @@ fn run_aws_login(
     };
     controller
         .lock()
-        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .map_err(|_| "secretd state is unavailable".to_string())?
         .set_aws_login_status(AwsLoginStatus::Discovering);
     notify();
     let discovery = broker.discover_accounts(&mut settings);
     let mut controller = controller
         .lock()
-        .map_err(|_| "SecretD state is unavailable".to_string())?;
+        .map_err(|_| "secretd state is unavailable".to_string())?;
     match discovery {
         Ok(()) => controller.complete_aws_login(Ok(settings)),
         Err(error) => controller.complete_aws_discovery_failure(&settings, error),

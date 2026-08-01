@@ -39,7 +39,6 @@ impl std::error::Error for VaultError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecretSummary {
     pub name: String,
-    pub group: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -48,8 +47,6 @@ pub struct SecretSummary {
 #[serde(rename_all = "camelCase")]
 struct VaultEntry {
     value: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    group: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -208,7 +205,6 @@ impl VaultStore {
             .iter()
             .map(|(name, entry)| SecretSummary {
                 name: name.clone(),
-                group: entry.group.clone(),
                 created_at: entry.created_at.clone(),
                 updated_at: entry.updated_at.clone(),
             })
@@ -224,30 +220,8 @@ impl VaultStore {
             .ok_or_else(|| VaultError("Secret not found".into()))
     }
 
-    pub fn group(&self, name: &str) -> Result<Option<String>, VaultError> {
+    pub fn save_secret(&mut self, name: &str, value: &str) -> Result<(), VaultError> {
         let normalized = normalize_secret_name(name)?;
-        self.require_data()?
-            .secrets
-            .get(&normalized)
-            .map(|entry| entry.group.clone())
-            .ok_or_else(|| VaultError("Secret not found".into()))
-    }
-
-    pub fn save_secret(
-        &mut self,
-        name: &str,
-        value: &str,
-        group: Option<&str>,
-    ) -> Result<(), VaultError> {
-        let normalized = normalize_secret_name(name)?;
-        let normalized_group = match group {
-            Some(value) => normalize_secret_group(value)?,
-            None => self
-                .require_data()?
-                .secrets
-                .get(&normalized)
-                .and_then(|entry| entry.group.clone()),
-        };
         let now = now();
         let data = self.require_data_mut()?;
         let created_at = data
@@ -258,7 +232,6 @@ impl VaultStore {
             normalized,
             VaultEntry {
                 value: value.into(),
-                group: normalized_group,
                 created_at,
                 updated_at: now,
             },
@@ -371,17 +344,6 @@ pub fn normalize_secret_name(name: &str) -> Result<String, VaultError> {
     Ok(normalized)
 }
 
-pub fn normalize_secret_group(group: &str) -> Result<Option<String>, VaultError> {
-    let normalized = group.trim();
-    if normalized.is_empty() {
-        return Ok(None);
-    }
-    if normalized.chars().count() > 128 || normalized.chars().any(char::is_control) {
-        return Err(VaultError("Secret group is invalid".into()));
-    }
-    Ok(Some(normalized.into()))
-}
-
 fn validate_password(password: &str) -> Result<(), VaultError> {
     if password.chars().count() < MIN_MASTER_PASSWORD_LENGTH {
         return Err(VaultError(format!(
@@ -423,11 +385,8 @@ fn validate_plaintext(data: &VaultPlaintext) -> Result<(), VaultError> {
             "Vault plaintext has an unsupported format".into(),
         ));
     }
-    for (name, entry) in &data.secrets {
+    for name in data.secrets.keys() {
         normalize_secret_name(name)?;
-        if let Some(group) = &entry.group {
-            normalize_secret_group(group)?;
-        }
     }
     Ok(())
 }
@@ -564,7 +523,7 @@ mod tests {
         let mut vault = VaultStore::new(path.clone());
         vault.create("correct horse").unwrap();
         vault
-            .save_secret(" services/example ", "very secret", Some(" read-only "))
+            .save_secret(" services/example ", "very secret")
             .unwrap();
         vault.lock();
 
@@ -573,10 +532,6 @@ mod tests {
         assert_eq!(
             &*reopened.reveal("services/example").unwrap(),
             "very secret"
-        );
-        assert_eq!(
-            reopened.group("services/example").unwrap().as_deref(),
-            Some("read-only")
         );
         reopened.change_password("different horse").unwrap();
         reopened.lock();
@@ -609,14 +564,10 @@ mod tests {
             &*vault.reveal("services/github/token").unwrap(),
             "deno-secret"
         );
-        assert_eq!(
-            vault.group("services/github/token").unwrap().as_deref(),
-            Some("deployment-read-only")
-        );
     }
 
     #[test]
-    fn rejects_invalid_names_and_groups() {
+    fn rejects_invalid_names() {
         assert_eq!(
             normalize_secret_name(" services/example ").unwrap(),
             "services/example"
@@ -624,11 +575,6 @@ mod tests {
         for name in ["", "a//b", "a/../b", "a/__proto__/b", "a\nb"] {
             assert!(normalize_secret_name(name).is_err(), "{name}");
         }
-        assert_eq!(
-            normalize_secret_group(" read-only ").unwrap().as_deref(),
-            Some("read-only")
-        );
-        assert_eq!(normalize_secret_group(" ").unwrap(), None);
     }
 
     #[test]

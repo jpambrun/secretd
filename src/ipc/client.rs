@@ -35,14 +35,14 @@ fn request(
     profile: Option<&str>,
 ) -> Result<Zeroizing<String>, String> {
     let endpoint: EndpointFile = serde_json::from_slice(
-        &fs::read(runtime_path).map_err(|_| "SecretD desktop is not running".to_string())?,
+        &fs::read(runtime_path).map_err(|_| "secretd desktop is not running".to_string())?,
     )
-    .map_err(|_| "SecretD runtime file is invalid".to_string())?;
+    .map_err(|_| "secretd runtime file is invalid".to_string())?;
     if endpoint.version != 1 || endpoint.host != "127.0.0.1" || endpoint.token.is_empty() {
-        return Err("SecretD runtime file is invalid".into());
+        return Err("secretd runtime file is invalid".into());
     }
     let mut connection = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
-        .map_err(|error| format!("Could not connect to SecretD: {error}"))?;
+        .map_err(|error| format!("Could not connect to secretd: {error}"))?;
     connection
         .set_read_timeout(Some(RESPONSE_TIMEOUT))
         .map_err(|error| error.to_string())?;
@@ -65,17 +65,17 @@ fn request(
     BufReader::new(connection)
         .take(MAX_RESPONSE_BYTES)
         .read_until(b'\n', &mut response)
-        .map_err(|error| format!("Could not read SecretD response: {error}"))?;
+        .map_err(|error| format!("Could not read secretd response: {error}"))?;
     if response.is_empty() {
-        return Err("SecretD closed the request".into());
+        return Err("secretd closed the request".into());
     }
     let parsed: ClientResponse = serde_json::from_slice(&response)
-        .map_err(|_| "SecretD returned an invalid response".to_string())?;
+        .map_err(|_| "secretd returned an invalid response".to_string())?;
     if parsed.ok {
         return parsed
             .value
             .map(Zeroizing::new)
-            .ok_or_else(|| "SecretD returned an invalid response".to_string());
+            .ok_or_else(|| "secretd returned an invalid response".to_string());
     }
     Err(parsed
         .error

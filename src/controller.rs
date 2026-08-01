@@ -12,7 +12,10 @@ use crate::{
         AwsAccessLevel, AwsBroker, AwsConfiguration, AwsLoginStatus, AwsSettings,
         AwsSettingsSummary, validate_aws_profile,
     },
-    grants::{Grant, GrantScope, GrantStore, MAX_GRANT_SECONDS, now_millis},
+    grants::{
+        DEFAULT_GRANT_SECONDS, GRANT_EXTENSION_SECONDS, Grant, GrantStore, MAX_GRANT_SECONDS,
+        now_millis,
+    },
     process::{
         ProcessIdentity, is_launchd_process, omit_secretd_client_processes, process_is_alive,
         same_process,
@@ -50,9 +53,6 @@ pub struct AuditEntry {
     pub occurred_at: u64,
     pub action: AuditAction,
     pub secret: String,
-    pub group: Option<String>,
-    pub scope: Option<GrantScope>,
-    pub resource: Option<String>,
     pub ttl_seconds: Option<u64>,
     pub process: ProcessIdentity,
 }
@@ -61,7 +61,6 @@ pub struct AuditEntry {
 pub struct PendingRequest {
     pub id: String,
     pub secret: String,
-    pub group: Option<String>,
     pub verified: bool,
     pub process_tree: Vec<ProcessIdentity>,
     pub origin: ProcessIdentity,
@@ -99,6 +98,7 @@ pub struct AwsCredentialGrant {
     pub level: AwsAccessLevel,
     pub process: ProcessIdentity,
     pub created_at: u64,
+    pub expires_at: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -156,8 +156,9 @@ impl Controller {
     }
 
     pub fn snapshot(&mut self) -> AppSnapshot {
+        let now = now_millis();
         self.aws_process_decisions
-            .retain(|decision| process_is_alive(&decision.process));
+            .retain(|decision| decision.expires_at > now && process_is_alive(&decision.process));
         let vault_exists = self.vault.exists().unwrap_or(false);
         let unlocked = self.vault.unlocked();
         let secrets = if unlocked {
@@ -214,7 +215,7 @@ impl Controller {
         }
         let pending: Vec<_> = self.pending.keys().cloned().collect();
         for id in pending {
-            let _ = self.respond(&id, ApprovalDecision::Deny, None, GrantScope::Secret, None);
+            let _ = self.respond(&id, ApprovalDecision::Deny, None, None);
         }
         for sender in self
             .pending_aws_resolutions
@@ -233,14 +234,13 @@ impl Controller {
         name: &str,
         value: &str,
         previous_name: Option<&str>,
-        group: Option<&str>,
     ) -> Result<(), VaultError> {
         if let Some(previous) = previous_name
             && normalize_secret_name(previous)? != normalize_secret_name(name)?
         {
             self.vault.rename(previous, name)?;
         }
-        self.vault.save_secret(name, value, group)
+        self.vault.save_secret(name, value)
     }
 
     pub fn reveal_secret(&self, name: &str) -> Result<Zeroizing<String>, VaultError> {
@@ -251,7 +251,7 @@ impl Controller {
         let normalized = normalize_secret_name(name)?;
         self.vault.delete(&normalized)?;
         for grant in self.grants.list() {
-            if grant.scope == GrantScope::Secret && grant.resource == normalized {
+            if grant.resource == normalized {
                 self.revoke_grant(&grant.id);
             }
         }
@@ -354,8 +354,9 @@ impl Controller {
         verified: bool,
     ) -> Result<AwsRequestOutcome, VaultError> {
         let profile = normalize_aws_profile(profile)?;
+        let now = now_millis();
         self.aws_process_decisions
-            .retain(|decision| process_is_alive(&decision.process));
+            .retain(|decision| decision.expires_at > now && process_is_alive(&decision.process));
         let process_tree = omit_secretd_client_processes(&process_tree);
         let Some(origin) = process_tree.first().cloned() else {
             return Err(VaultError(
@@ -365,7 +366,7 @@ impl Controller {
         if self.vault.unlocked() {
             self.vault
                 .aws_settings()?
-                .ok_or_else(|| VaultError("AWS SSO is not configured in SecretD".into()))?
+                .ok_or_else(|| VaultError("AWS SSO is not configured in secretd".into()))?
                 .target(&profile)
                 .map_err(VaultError)?;
             if verified
@@ -398,6 +399,7 @@ impl Controller {
         id: &str,
         level: Option<AwsAccessLevel>,
         grant_process: Option<ProcessIdentity>,
+        ttl_seconds: Option<u64>,
     ) -> Result<(), VaultError> {
         let request = self
             .pending_aws
@@ -410,22 +412,25 @@ impl Controller {
             }
             self.vault
                 .aws_settings()?
-                .ok_or_else(|| VaultError("AWS SSO is not configured in SecretD".into()))?
+                .ok_or_else(|| VaultError("AWS SSO is not configured in secretd".into()))?
                 .target(&request.profile)
                 .map_err(VaultError)?;
             if request.verified {
+                let ttl_seconds = validated_grant_seconds(ttl_seconds)?;
                 let grant_process =
                     validated_grant_process(&request.process_tree, &request.origin, grant_process)?;
                 self.aws_process_decisions.retain(|decision| {
                     decision.profile != request.profile
                         || !same_process(&decision.process, &grant_process)
                 });
+                let now = now_millis();
                 self.aws_process_decisions.push(AwsCredentialGrant {
                     id: Uuid::new_v4().to_string(),
                     profile: request.profile.clone(),
                     level,
                     process: grant_process,
-                    created_at: now_millis(),
+                    created_at: now,
+                    expires_at: now.saturating_add(ttl_seconds.saturating_mul(1_000)),
                 });
             }
             AwsRequestResolution::Approved(level)
@@ -449,11 +454,25 @@ impl Controller {
             .retain(|decision| decision.id != id);
     }
 
+    pub fn extend_aws_grant(&mut self, id: &str) {
+        let now = now_millis();
+        if let Some(grant) = self
+            .aws_process_decisions
+            .iter_mut()
+            .find(|grant| grant.id == id && grant.expires_at > now)
+        {
+            grant.expires_at = grant
+                .expires_at
+                .saturating_add(GRANT_EXTENSION_SECONDS.saturating_mul(1_000))
+                .min(now.saturating_add(MAX_GRANT_SECONDS.saturating_mul(1_000)));
+        }
+    }
+
     pub fn aws_credential_context(&self) -> Result<(AwsBroker, AwsSettings), VaultError> {
         let settings = self
             .vault
             .aws_settings()?
-            .ok_or_else(|| VaultError("AWS SSO is not configured in SecretD".into()))?;
+            .ok_or_else(|| VaultError("AWS SSO is not configured in secretd".into()))?;
         Ok((self.aws_broker.clone(), settings))
     }
 
@@ -469,7 +488,7 @@ impl Controller {
         let mut current = self
             .vault
             .aws_settings()?
-            .ok_or_else(|| VaultError("AWS SSO is not configured in SecretD".into()))?;
+            .ok_or_else(|| VaultError("AWS SSO is not configured in secretd".into()))?;
         if current.start_url != session.start_url || current.sso_region != session.sso_region {
             return Err(VaultError(
                 "AWS SSO setup changed while the operation was in progress; retry it".into(),
@@ -500,14 +519,7 @@ impl Controller {
             id: String::new(),
             occurred_at: 0,
             action: AuditAction::Revoked,
-            secret: if grant.scope == GrantScope::Secret {
-                grant.resource.clone()
-            } else {
-                String::new()
-            },
-            group: (grant.scope == GrantScope::Group).then(|| grant.resource.clone()),
-            scope: Some(grant.scope),
-            resource: Some(grant.resource),
+            secret: grant.resource,
             ttl_seconds: None,
             process: grant.process,
         });
@@ -527,32 +539,26 @@ impl Controller {
             ));
         };
         if !self.vault.unlocked() {
-            return Ok(self.queue_request(secret, None, process_tree, origin, verified, true));
+            return Ok(self.queue_request(secret, process_tree, origin, verified, true));
         }
         drop(self.vault.reveal(&secret)?);
-        let group = self.vault.group(&secret)?;
-        if verified && let Some(grant) = self.grants.find(&secret, group.as_deref(), &process_tree)
-        {
+        if verified && self.grants.find(&secret, &process_tree).is_some() {
             self.record_audit(AuditEntry {
                 id: String::new(),
                 occurred_at: 0,
                 action: AuditAction::AutoGranted,
                 secret: secret.clone(),
-                group,
-                scope: Some(grant.scope),
-                resource: Some(grant.resource),
                 ttl_seconds: None,
                 process: origin,
             });
             return Ok(RequestOutcome::Immediate(self.vault.reveal(&secret)?));
         }
-        Ok(self.queue_request(secret, group, process_tree, origin, verified, false))
+        Ok(self.queue_request(secret, process_tree, origin, verified, false))
     }
 
     fn queue_request(
         &mut self,
         secret: String,
-        group: Option<String>,
         process_tree: Vec<ProcessIdentity>,
         origin: ProcessIdentity,
         verified: bool,
@@ -562,7 +568,6 @@ impl Controller {
         let request = PendingRequest {
             id: id.clone(),
             secret,
-            group,
             verified,
             process_tree,
             origin,
@@ -583,16 +588,9 @@ impl Controller {
             let Some(request) = self.pending.get(&id).cloned() else {
                 continue;
             };
-            let prepared = (|| {
-                drop(self.vault.reveal(&request.secret)?);
-                self.vault.group(&request.secret)
-            })();
+            let prepared = self.vault.reveal(&request.secret);
             match prepared {
-                Ok(group) => {
-                    if let Some(request) = self.pending.get_mut(&id) {
-                        request.group = group;
-                    }
-                }
+                Ok(value) => drop(value),
                 Err(error) => {
                     self.pending.remove(&id);
                     if let Some(sender) = self.pending_resolutions.remove(&id) {
@@ -608,7 +606,6 @@ impl Controller {
         id: &str,
         decision: ApprovalDecision,
         ttl_seconds: Option<u64>,
-        mut scope: GrantScope,
         grant_process: Option<ProcessIdentity>,
     ) -> Result<(), VaultError> {
         let request = self
@@ -619,21 +616,11 @@ impl Controller {
         if self.waiting_for_unlock.contains(id) && decision != ApprovalDecision::Deny {
             return Err(VaultError("Vault is locked".into()));
         }
-        if decision != ApprovalDecision::Temporary {
-            scope = GrantScope::Secret;
-        }
-        if scope == GrantScope::Group && request.group.is_none() {
-            return Err(VaultError("This secret does not belong to a group".into()));
-        }
         if decision == ApprovalDecision::Temporary && !request.verified {
             return Err(VaultError(
                 "Unverified requests can only be allowed once".into(),
             ));
         }
-        let resource = match scope {
-            GrantScope::Secret => request.secret.clone(),
-            GrantScope::Group => request.group.clone().expect("group scope was validated"),
-        };
         let grant_process = if decision == ApprovalDecision::Temporary {
             Some(validated_grant_process(
                 &request.process_tree,
@@ -644,13 +631,9 @@ impl Controller {
             None
         };
         if let Some(grant_process) = &grant_process {
+            let ttl_seconds = validated_grant_seconds(ttl_seconds)?;
             self.grants
-                .add(
-                    scope,
-                    resource.clone(),
-                    grant_process.clone(),
-                    ttl_seconds.unwrap_or(0),
-                )
+                .add(request.secret.clone(), grant_process.clone(), ttl_seconds)
                 .map_err(VaultError)?;
         }
         self.record_audit(AuditEntry {
@@ -662,11 +645,8 @@ impl Controller {
                 ApprovalDecision::Temporary => AuditAction::GrantedTemporarily,
             },
             secret: request.secret,
-            group: request.group,
-            scope: (decision != ApprovalDecision::Deny).then_some(scope),
-            resource: (decision != ApprovalDecision::Deny).then_some(resource),
             ttl_seconds: (decision == ApprovalDecision::Temporary)
-                .then_some(ttl_seconds.unwrap_or(0)),
+                .then_some(ttl_seconds.unwrap_or(DEFAULT_GRANT_SECONDS)),
             process: grant_process.unwrap_or(request.origin),
         });
         self.pending.remove(id);
@@ -693,9 +673,6 @@ impl Controller {
             occurred_at: 0,
             action: AuditAction::TimedOut,
             secret: request.secret,
-            group: request.group,
-            scope: None,
-            resource: None,
             ttl_seconds: None,
             process: request.origin,
         });
@@ -712,6 +689,10 @@ impl Controller {
         if self.audit.len() > 500 {
             self.audit.drain(..self.audit.len() - 500);
         }
+    }
+
+    pub fn extend_grant(&mut self, id: &str) {
+        let _ = self.grants.extend(id);
     }
 }
 
@@ -737,6 +718,16 @@ fn validated_grant_process(
         .find(|process| same_process(process, &selected))
         .cloned()
         .ok_or_else(|| VaultError("Selected process is not in the verified process tree".into()))
+}
+
+fn validated_grant_seconds(seconds: Option<u64>) -> Result<u64, VaultError> {
+    let seconds = seconds.unwrap_or(DEFAULT_GRANT_SECONDS);
+    if seconds == 0 || seconds > MAX_GRANT_SECONDS {
+        return Err(VaultError(format!(
+            "Grant duration must be between 1 and {MAX_GRANT_SECONDS} seconds"
+        )));
+    }
+    Ok(seconds)
 }
 
 #[cfg(test)]
@@ -793,7 +784,7 @@ mod tests {
             panic!("first request should require a decision");
         };
         controller
-            .respond_aws(&id, Some(AwsAccessLevel::ReadOnly), None)
+            .respond_aws(&id, Some(AwsAccessLevel::ReadOnly), None, None)
             .unwrap();
         assert_eq!(
             receiver.recv().unwrap(),
@@ -803,6 +794,29 @@ mod tests {
         assert_eq!(snapshot.aws_grants.len(), 1);
         assert_eq!(snapshot.aws_grants[0].profile, "prod");
         assert_eq!(snapshot.aws_grants[0].level, AwsAccessLevel::ReadOnly);
+        assert_eq!(
+            snapshot.aws_grants[0]
+                .expires_at
+                .saturating_sub(snapshot.aws_grants[0].created_at),
+            DEFAULT_GRANT_SECONDS * 1_000
+        );
+        let grant_id = snapshot.aws_grants[0].id.clone();
+        let original_expiry = snapshot.aws_grants[0].expires_at;
+        controller.extend_aws_grant(&grant_id);
+        assert_eq!(
+            controller.snapshot().aws_grants[0].expires_at,
+            original_expiry + GRANT_EXTENSION_SECONDS * 1_000
+        );
+        controller.extend_aws_grant(&grant_id);
+        assert_eq!(
+            controller.snapshot().aws_grants[0].expires_at,
+            original_expiry + 2 * GRANT_EXTENSION_SECONDS * 1_000
+        );
+        controller.extend_aws_grant(&grant_id);
+        assert!(
+            controller.snapshot().aws_grants[0].expires_at
+                <= now_millis() + MAX_GRANT_SECONDS * 1_000
+        );
 
         let outcome = controller
             .begin_aws_request("prod", vec![terraform.clone()], true)
@@ -812,7 +826,6 @@ mod tests {
             AwsRequestOutcome::Immediate(AwsAccessLevel::ReadOnly)
         ));
 
-        let grant_id = snapshot.aws_grants[0].id.clone();
         controller.revoke_aws_grant(&grant_id);
         assert!(controller.snapshot().aws_grants.is_empty());
         assert!(matches!(
@@ -848,10 +861,10 @@ mod tests {
         };
 
         controller
-            .respond_aws(&admin_id, Some(AwsAccessLevel::Admin), None)
+            .respond_aws(&admin_id, Some(AwsAccessLevel::Admin), None, None)
             .unwrap();
         controller
-            .respond_aws(&read_only_id, Some(AwsAccessLevel::ReadOnly), None)
+            .respond_aws(&read_only_id, Some(AwsAccessLevel::ReadOnly), None, None)
             .unwrap();
 
         let grants = controller.snapshot().aws_grants;
@@ -882,7 +895,12 @@ mod tests {
             panic!("first child should require approval");
         };
         controller
-            .respond_aws(&id, Some(AwsAccessLevel::Admin), Some(ancestor.clone()))
+            .respond_aws(
+                &id,
+                Some(AwsAccessLevel::Admin),
+                Some(ancestor.clone()),
+                None,
+            )
             .unwrap();
 
         let second_child = process(21, "/usr/local/bin/terraform");
@@ -904,6 +922,15 @@ mod tests {
             level: AwsAccessLevel::Admin,
             process: process(u32::MAX, "/missing/terraform"),
             created_at: now_millis(),
+            expires_at: now_millis().saturating_add(DEFAULT_GRANT_SECONDS * 1_000),
+        });
+        controller.aws_process_decisions.push(AwsCredentialGrant {
+            id: "expired".into(),
+            profile: "prod".into(),
+            level: AwsAccessLevel::ReadOnly,
+            process: live_process(),
+            created_at: now_millis().saturating_sub(DEFAULT_GRANT_SECONDS * 1_000),
+            expires_at: now_millis().saturating_sub(1),
         });
 
         assert!(controller.snapshot().aws_grants.is_empty());
@@ -941,70 +968,12 @@ mod tests {
     }
 
     #[test]
-    fn approval_creates_group_grant_and_reuses_it() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut controller = Controller::new(directory.path().join("vault.json"));
-        controller.create_vault("correct horse").unwrap();
-        controller
-            .save_secret(
-                "aws/access-key",
-                "first",
-                None,
-                Some("deployment-read-only"),
-            )
-            .unwrap();
-        controller
-            .save_secret(
-                "aws/secret-key",
-                "second",
-                None,
-                Some("deployment-read-only"),
-            )
-            .unwrap();
-        let origin = process(20, "/usr/local/bin/deploy");
-        let outcome = controller
-            .begin_request(
-                "aws/access-key",
-                vec![process(30, "/usr/local/bin/secretd"), origin.clone()],
-                true,
-            )
-            .unwrap();
-        let RequestOutcome::Pending { id, receiver } = outcome else {
-            panic!("first request should require approval");
-        };
-        controller
-            .respond(
-                &id,
-                ApprovalDecision::Temporary,
-                Some(300),
-                GrantScope::Group,
-                None,
-            )
-            .unwrap();
-        assert_eq!(
-            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
-            RequestResolution::Approved
-        );
-        let reused = controller
-            .begin_request("aws/secret-key", vec![origin], true)
-            .unwrap();
-        let RequestOutcome::Immediate(value) = reused else {
-            panic!("group grant should be reused");
-        };
-        assert_eq!(&*value, "second");
-        assert_eq!(
-            controller.snapshot().audit[0].action,
-            AuditAction::AutoGranted
-        );
-    }
-
-    #[test]
     fn secret_grant_for_an_ancestor_is_reused_by_another_child() {
         let directory = tempfile::tempdir().unwrap();
         let mut controller = Controller::new(directory.path().join("vault.json"));
         controller.create_vault("correct horse").unwrap();
         controller
-            .save_secret("deploy/token", "secret", None, None)
+            .save_secret("deploy/token", "secret", None)
             .unwrap();
         let ancestor = process(10, "/bin/zsh");
         let first_child = process(20, "/usr/local/bin/terraform");
@@ -1019,7 +988,6 @@ mod tests {
                 &id,
                 ApprovalDecision::Temporary,
                 Some(300),
-                GrantScope::Secret,
                 Some(ancestor.clone()),
             )
             .unwrap();
@@ -1038,9 +1006,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut controller = Controller::new(directory.path().join("vault.json"));
         controller.create_vault("correct horse").unwrap();
-        controller
-            .save_secret("token", "secret", None, None)
-            .unwrap();
+        controller.save_secret("token", "secret", None).unwrap();
         let launchd = process(1, "/sbin/launchd");
         let RequestOutcome::Pending { id, .. } = controller
             .begin_request(
@@ -1054,13 +1020,7 @@ mod tests {
         };
 
         let error = controller
-            .respond(
-                &id,
-                ApprovalDecision::Temporary,
-                Some(300),
-                GrantScope::Secret,
-                Some(launchd),
-            )
+            .respond(&id, ApprovalDecision::Temporary, Some(300), Some(launchd))
             .unwrap_err();
         assert!(error.to_string().contains("launchd"));
     }
@@ -1071,7 +1031,7 @@ mod tests {
         let mut controller = Controller::new(directory.path().join("vault.json"));
         controller.create_vault("correct horse").unwrap();
         controller
-            .save_secret("qwer", "correct password", None, Some("ro"))
+            .save_secret("qwer", "correct password", None)
             .unwrap();
         controller.lock();
 
@@ -1084,12 +1044,8 @@ mod tests {
         assert_eq!(controller.snapshot().pending.len(), 1);
 
         controller.unlock("correct horse").unwrap();
-        assert_eq!(
-            controller.snapshot().pending[0].group.as_deref(),
-            Some("ro")
-        );
         controller
-            .respond(&id, ApprovalDecision::Once, None, GrantScope::Secret, None)
+            .respond(&id, ApprovalDecision::Once, None, None)
             .unwrap();
         assert_eq!(
             receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
@@ -1121,5 +1077,18 @@ mod tests {
             RequestResolution::Failed("Secret not found".into())
         );
         assert!(controller.snapshot().pending.is_empty());
+    }
+
+    #[test]
+    fn grant_durations_default_to_thirty_minutes_and_cannot_start_over_one_hour() {
+        assert_eq!(
+            validated_grant_seconds(None).unwrap(),
+            DEFAULT_GRANT_SECONDS
+        );
+        assert_eq!(
+            validated_grant_seconds(Some(MAX_GRANT_SECONDS)).unwrap(),
+            MAX_GRANT_SECONDS
+        );
+        assert!(validated_grant_seconds(Some(MAX_GRANT_SECONDS + 1)).is_err());
     }
 }

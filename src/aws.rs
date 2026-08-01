@@ -199,7 +199,7 @@ impl AwsSettings {
         self.targets
             .iter()
             .find(|target| target.profile == profile)
-            .ok_or_else(|| format!("AWS profile '{profile}' is not configured in SecretD"))
+            .ok_or_else(|| format!("AWS profile '{profile}' is not configured in secretd"))
     }
 
     pub fn logged_in(&self) -> bool {
@@ -593,7 +593,7 @@ async fn ensure_registration(
         .grant_types(REFRESH_TOKEN_GRANT)
         .send()
         .await
-        .map_err(|error| format!("Could not register SecretD with AWS SSO: {error}"))?;
+        .map_err(|error| format!("Could not register secretd with AWS SSO: {error}"))?;
     settings.registration = Some(AwsOidcRegistration {
         client_id: required(output.client_id(), "OIDC client ID")?,
         client_secret: required(output.client_secret(), "OIDC client secret")?,

@@ -37,7 +37,7 @@ enum WindowKind {
 }
 
 const MAIN_WINDOW_SIZE: (f64, f64) = (1040.0, 700.0);
-const REQUEST_WINDOW_SIZE: (f64, f64) = (620.0, 480.0);
+const REQUEST_WINDOW_SIZE: (f64, f64) = (620.0, 520.0);
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let mut builder = EventLoop::<AppEvent>::with_user_event();
@@ -89,7 +89,7 @@ impl Runtime {
                     .window()
                     .request_redraw();
             }
-            Err(error) => eprintln!("Could not open SecretD window: {error}"),
+            Err(error) => eprintln!("Could not open secretd window: {error}"),
         }
     }
 
@@ -109,7 +109,7 @@ impl Runtime {
                     .window()
                     .request_redraw();
             }
-            Err(error) => eprintln!("Could not open SecretD access request: {error}"),
+            Err(error) => eprintln!("Could not open secretd access request: {error}"),
         }
     }
 
@@ -159,7 +159,7 @@ impl Runtime {
             return;
         };
         if let Err(error) = ui.gl_window.make_current() {
-            eprintln!("Could not activate SecretD OpenGL context: {error}");
+            eprintln!("Could not activate secretd OpenGL context: {error}");
             return;
         }
         let mut quit = false;
@@ -173,7 +173,7 @@ impl Runtime {
         }
         ui.egui.paint(ui.gl_window.window());
         if let Err(error) = ui.gl_window.swap_buffers() {
-            eprintln!("Could not present SecretD window: {error}");
+            eprintln!("Could not present secretd window: {error}");
         }
         if !ui.shown {
             ui.gl_window.window().set_visible(true);
@@ -191,7 +191,7 @@ impl Runtime {
                 return;
             };
             if let Err(error) = ui.gl_window.make_current() {
-                eprintln!("Could not activate SecretD request OpenGL context: {error}");
+                eprintln!("Could not activate secretd request OpenGL context: {error}");
                 return;
             }
             let mut action = RequestDialogAction::None;
@@ -205,7 +205,7 @@ impl Runtime {
             }
             ui.egui.paint(ui.gl_window.window());
             if let Err(error) = ui.gl_window.swap_buffers() {
-                eprintln!("Could not present SecretD access request: {error}");
+                eprintln!("Could not present secretd access request: {error}");
             }
             if !ui.shown {
                 ui.gl_window.window().set_visible(true);
@@ -228,7 +228,7 @@ impl ApplicationHandler<AppEvent> for Runtime {
             match SecretDApp::new(self.proxy.clone()) {
                 Ok(app) => self.app = Some(app),
                 Err(error) => {
-                    eprintln!("Could not start SecretD: {error}");
+                    eprintln!("Could not start secretd: {error}");
                     event_loop.exit();
                 }
             }
@@ -340,7 +340,7 @@ impl ApplicationHandler<AppEvent> for Runtime {
         };
         if let WindowEvent::Resized(size) = &event {
             if let Err(error) = ui.gl_window.make_current() {
-                eprintln!("Could not activate resized SecretD window: {error}");
+                eprintln!("Could not activate resized secretd window: {error}");
                 return;
             }
             ui.gl_window.resize(*size);
@@ -411,14 +411,14 @@ impl UiRuntime {
 
     fn destroy(mut self) {
         if let Err(error) = self.gl_window.make_current() {
-            eprintln!("Could not activate SecretD OpenGL context for cleanup: {error}");
+            eprintln!("Could not activate secretd OpenGL context for cleanup: {error}");
         }
         self.egui.destroy();
         unsafe {
             self.gl.finish();
         }
         if let Err(error) = self.gl_window.make_not_current() {
-            eprintln!("Could not detach SecretD OpenGL context: {error}");
+            eprintln!("Could not detach secretd OpenGL context: {error}");
         }
     }
 }
@@ -437,14 +437,14 @@ impl GlutinWindowContext {
                 .with_resizable(true)
                 .with_inner_size(LogicalSize::new(MAIN_WINDOW_SIZE.0, MAIN_WINDOW_SIZE.1))
                 .with_min_inner_size(LogicalSize::new(720.0, 520.0))
-                .with_title("SecretD"),
+                .with_title("secretd"),
             WindowKind::Request => WindowAttributes::default()
                 .with_resizable(false)
                 .with_inner_size(LogicalSize::new(
                     REQUEST_WINDOW_SIZE.0,
                     REQUEST_WINDOW_SIZE.1,
                 ))
-                .with_title("SecretD Access Request"),
+                .with_title("secretd access request"),
         }
         .with_visible(false);
         let config_template = ConfigTemplateBuilder::new()
@@ -552,6 +552,6 @@ mod tests {
     fn request_window_is_compact_relative_to_the_main_window() {
         assert!(REQUEST_WINDOW_SIZE.0 < MAIN_WINDOW_SIZE.0);
         assert!(REQUEST_WINDOW_SIZE.1 < MAIN_WINDOW_SIZE.1);
-        assert!(REQUEST_WINDOW_SIZE.1 >= 480.0);
+        assert!(REQUEST_WINDOW_SIZE.1 >= 520.0);
     }
 }
