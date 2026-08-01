@@ -10,15 +10,14 @@ const TRAY_ICON_PNG: &str = include_str!("../assets/tray-light.png.base64");
 pub enum TrayStatus {
     Locked,
     Unlocked,
-    Pending,
 }
 
-pub fn tray_icon(_status: TrayStatus) -> Result<Icon, String> {
-    let (rgba, width, height) = decode_tray_icon()?;
+pub fn tray_icon(status: TrayStatus) -> Result<Icon, String> {
+    let (rgba, width, height) = decode_tray_icon(status)?;
     Icon::from_rgba(rgba, width, height).map_err(|error| error.to_string())
 }
 
-fn decode_tray_icon() -> Result<(Vec<u8>, u32, u32), String> {
+fn decode_tray_icon(status: TrayStatus) -> Result<(Vec<u8>, u32, u32), String> {
     let encoded = STANDARD
         .decode(TRAY_ICON_PNG.trim())
         .map_err(|error| format!("invalid embedded tray icon: {error}"))?;
@@ -40,18 +39,42 @@ fn decode_tray_icon() -> Result<(Vec<u8>, u32, u32), String> {
         return Err("embedded tray icon must be an 8-bit RGBA PNG".to_owned());
     }
     rgba.truncate(info.buffer_size());
+    let color = match status {
+        TrayStatus::Locked => [45, 45, 48],
+        TrayStatus::Unlocked => [235, 235, 240],
+    };
+    for pixel in rgba.chunks_exact_mut(4) {
+        if pixel[3] != 0 {
+            pixel[..3].copy_from_slice(&color);
+        }
+    }
     Ok((rgba, info.width, info.height))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::decode_tray_icon;
+    use super::{TrayStatus, decode_tray_icon};
 
     #[test]
-    fn embeds_the_original_typescript_tray_icon() {
-        let (rgba, width, height) = decode_tray_icon().expect("tray icon should decode");
+    fn embeds_the_original_typescript_tray_icon_shape() {
+        let (rgba, width, height) =
+            decode_tray_icon(TrayStatus::Locked).expect("tray icon should decode");
 
         assert_eq!((width, height), (44, 44));
         assert_eq!(rgba.len(), 44 * 44 * 4);
+    }
+
+    #[test]
+    fn uses_dark_locked_and_light_unlocked_pixels() {
+        let (locked, _, _) = decode_tray_icon(TrayStatus::Locked).unwrap();
+        let (unlocked, _, _) = decode_tray_icon(TrayStatus::Unlocked).unwrap();
+        let locked_pixel = locked.chunks_exact(4).find(|pixel| pixel[3] != 0).unwrap();
+        let unlocked_pixel = unlocked
+            .chunks_exact(4)
+            .find(|pixel| pixel[3] != 0)
+            .unwrap();
+
+        assert_eq!(&locked_pixel[..3], &[45, 45, 48]);
+        assert_eq!(&unlocked_pixel[..3], &[235, 235, 240]);
     }
 }

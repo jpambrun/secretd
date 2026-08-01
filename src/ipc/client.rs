@@ -8,12 +8,32 @@ use std::{
 
 use zeroize::Zeroizing;
 
-use super::protocol::{EndpointFile, GetRequest, GetResponse};
+use super::protocol::{ClientRequest, ClientResponse, EndpointFile};
 
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(25 * 60);
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 
 pub fn get_secret(runtime_path: &Path, secret: &str) -> Result<Zeroizing<String>, String> {
+    request(runtime_path, "get", Some(secret), None)
+}
+
+pub fn get_aws_credentials(
+    runtime_path: &Path,
+    profile: &str,
+) -> Result<Zeroizing<String>, String> {
+    request(runtime_path, "aws-credentials", None, Some(profile))
+}
+
+pub fn start_aws_login(runtime_path: &Path) -> Result<Zeroizing<String>, String> {
+    request(runtime_path, "aws-login", None, None)
+}
+
+fn request(
+    runtime_path: &Path,
+    action: &str,
+    secret: Option<&str>,
+    profile: Option<&str>,
+) -> Result<Zeroizing<String>, String> {
     let endpoint: EndpointFile = serde_json::from_slice(
         &fs::read(runtime_path).map_err(|_| "SecretD desktop is not running".to_string())?,
     )
@@ -26,11 +46,12 @@ pub fn get_secret(runtime_path: &Path, secret: &str) -> Result<Zeroizing<String>
     connection
         .set_read_timeout(Some(RESPONSE_TIMEOUT))
         .map_err(|error| error.to_string())?;
-    let request = GetRequest {
+    let request = ClientRequest {
         version: 1,
         token: endpoint.token,
-        action: "get".into(),
-        secret: secret.into(),
+        action: action.into(),
+        secret: secret.map(str::to_string),
+        profile: profile.map(str::to_string),
         pid: std::process::id(),
     };
     let mut bytes = Zeroizing::new(
@@ -48,7 +69,7 @@ pub fn get_secret(runtime_path: &Path, secret: &str) -> Result<Zeroizing<String>
     if response.is_empty() {
         return Err("SecretD closed the request".into());
     }
-    let parsed: GetResponse = serde_json::from_slice(&response)
+    let parsed: ClientResponse = serde_json::from_slice(&response)
         .map_err(|_| "SecretD returned an invalid response".to_string())?;
     if parsed.ok {
         return parsed

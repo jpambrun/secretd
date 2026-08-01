@@ -17,15 +17,19 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    controller::{Controller, RequestOutcome, RequestResolution},
+    aws::{AwsBroker, AwsLoginStatus, AwsSettings, is_session_expired_error},
+    controller::{
+        AwsRequestOutcome, AwsRequestResolution, Controller, RequestOutcome, RequestResolution,
+    },
     paths::ensure_parent,
     process::{inspect_process_tree, verify_connection_owner},
 };
 
-use super::protocol::{EndpointFile, GetRequest};
+use super::protocol::{ClientRequest, EndpointFile};
 
 const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const AWS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_CONNECTIONS: usize = 64;
 
 pub struct RequestServer {
@@ -145,54 +149,33 @@ fn handle_connection(
         if !constant_time_equal(&request.token, token) {
             return Err("Authentication failed".into());
         }
-        if request.version != 1
-            || request.action != "get"
-            || request.pid == 0
-            || request.secret.is_empty()
-        {
+        if request.version != 1 || request.pid == 0 {
             return Err("Invalid request".into());
         }
-        let verified = verify_connection_owner(request.pid, &connection);
-        let tree = inspect_process_tree(request.pid, 12)?;
-        if tree.is_empty() {
-            return Err("Unable to inspect the requesting process".into());
-        }
-        let outcome = controller
-            .lock()
-            .map_err(|_| "SecretD state is unavailable".to_string())?
-            .begin_request(&request.secret, tree, verified)
-            .map_err(|error| error.to_string())?;
-        match outcome {
-            RequestOutcome::Immediate(value) => Ok(value),
-            RequestOutcome::Pending { id, receiver } => {
-                notify();
-                match receiver.recv_timeout(REQUEST_TIMEOUT) {
-                    Ok(RequestResolution::Approved) => {
-                        let value = controller
-                            .lock()
-                            .map_err(|_| "SecretD state is unavailable".to_string())?
-                            .release_after_approval(&request.secret)
-                            .map_err(|error| error.to_string());
-                        notify();
-                        value
-                    }
-                    Ok(RequestResolution::Denied) => {
-                        notify();
-                        Err("Request denied or timed out".into())
-                    }
-                    Ok(RequestResolution::Failed(error)) => {
-                        notify();
-                        Err(error)
-                    }
-                    Err(_) => {
-                        if let Ok(mut controller) = controller.lock() {
-                            controller.timeout_request(&id);
-                        }
-                        notify();
-                        Err("Request denied or timed out".into())
-                    }
-                }
+        match request.action.as_str() {
+            "get" => {
+                let secret = request
+                    .secret
+                    .as_deref()
+                    .filter(|secret| !secret.is_empty())
+                    .ok_or_else(|| "Invalid request".to_string())?;
+                handle_secret_request(secret, request.pid, &connection, controller, notify)
             }
+            "aws-credentials" => {
+                let profile = request
+                    .profile
+                    .as_deref()
+                    .filter(|profile| !profile.is_empty())
+                    .ok_or_else(|| "Invalid request".to_string())?;
+                handle_aws_request(profile, request.pid, &connection, controller, notify)
+            }
+            "aws-login" => {
+                begin_aws_login(Arc::clone(controller), Arc::clone(notify))?;
+                Ok(Zeroizing::new(
+                    "AWS SSO login started in the SecretD window".into(),
+                ))
+            }
+            _ => Err("Invalid request".into()),
         }
     })();
 
@@ -206,7 +189,234 @@ fn handle_connection(
     }
 }
 
-fn read_request(connection: &mut TcpStream) -> Result<GetRequest, String> {
+fn request_process(
+    pid: u32,
+    connection: &TcpStream,
+) -> Result<(bool, Vec<crate::process::ProcessIdentity>), String> {
+    let verified = verify_connection_owner(pid, connection);
+    let tree = inspect_process_tree(pid, 12)?;
+    if tree.is_empty() {
+        return Err("Unable to inspect the requesting process".into());
+    }
+    Ok((verified, tree))
+}
+
+fn handle_secret_request(
+    secret: &str,
+    pid: u32,
+    connection: &TcpStream,
+    controller: &Arc<Mutex<Controller>>,
+    notify: &Arc<dyn Fn() + Send + Sync>,
+) -> Result<Zeroizing<String>, String> {
+    let (verified, tree) = request_process(pid, connection)?;
+    let outcome = controller
+        .lock()
+        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .begin_request(secret, tree, verified)
+        .map_err(|error| error.to_string())?;
+    match outcome {
+        RequestOutcome::Immediate(value) => Ok(value),
+        RequestOutcome::Pending { id, receiver } => {
+            notify();
+            match receiver.recv_timeout(REQUEST_TIMEOUT) {
+                Ok(RequestResolution::Approved) => {
+                    let value = controller
+                        .lock()
+                        .map_err(|_| "SecretD state is unavailable".to_string())?
+                        .release_after_approval(secret)
+                        .map_err(|error| error.to_string());
+                    notify();
+                    value
+                }
+                Ok(RequestResolution::Denied) => {
+                    notify();
+                    Err("Request denied or timed out".into())
+                }
+                Ok(RequestResolution::Failed(error)) => {
+                    notify();
+                    Err(error)
+                }
+                Err(_) => {
+                    if let Ok(mut controller) = controller.lock() {
+                        controller.timeout_request(&id);
+                    }
+                    notify();
+                    Err("Request denied or timed out".into())
+                }
+            }
+        }
+    }
+}
+
+fn handle_aws_request(
+    profile: &str,
+    pid: u32,
+    connection: &TcpStream,
+    controller: &Arc<Mutex<Controller>>,
+    notify: &Arc<dyn Fn() + Send + Sync>,
+) -> Result<Zeroizing<String>, String> {
+    let (verified, tree) = request_process(pid, connection)?;
+    let outcome = controller
+        .lock()
+        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .begin_aws_request(profile, tree, verified)
+        .map_err(|error| error.to_string())?;
+    let level = match outcome {
+        AwsRequestOutcome::Immediate(level) => level,
+        AwsRequestOutcome::Pending { id, receiver } => {
+            notify();
+            match receiver.recv_timeout(AWS_REQUEST_TIMEOUT) {
+                Ok(AwsRequestResolution::Approved(level)) => level,
+                Ok(AwsRequestResolution::Denied) => {
+                    notify();
+                    return Err("AWS credential request denied or timed out".into());
+                }
+                Err(_) => {
+                    if let Ok(mut controller) = controller.lock() {
+                        controller.timeout_aws_request(&id);
+                    }
+                    notify();
+                    return Err("AWS credential request denied or timed out".into());
+                }
+            }
+        }
+    };
+    let (broker, _) = controller
+        .lock()
+        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .aws_credential_context()
+        .map_err(|error| error.to_string())?;
+    let _operation = broker.operation()?;
+    // Reload the settings after acquiring the operation lock. Another concurrent
+    // credential helper may have completed the shared login while this one waited.
+    let (_, mut settings) = controller
+        .lock()
+        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .aws_credential_context()
+        .map_err(|error| error.to_string())?;
+    let credentials = match broker.credentials(&mut settings, profile, level) {
+        Ok(credentials) => credentials,
+        Err(error) if is_session_expired_error(&error) => {
+            let (_, login_settings) = controller
+                .lock()
+                .map_err(|_| "SecretD state is unavailable".to_string())?
+                .prepare_aws_login()
+                .map_err(|error| error.to_string())?;
+            notify();
+            run_aws_login(
+                &broker,
+                login_settings,
+                Arc::clone(controller),
+                Arc::clone(notify),
+            )?;
+            let (_, mut refreshed_settings) = controller
+                .lock()
+                .map_err(|_| "SecretD state is unavailable".to_string())?
+                .aws_credential_context()
+                .map_err(|error| error.to_string())?;
+            let credentials = broker.credentials(&mut refreshed_settings, profile, level)?;
+            settings = refreshed_settings;
+            credentials
+        }
+        Err(error) => return Err(error),
+    };
+    controller
+        .lock()
+        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .persist_aws_settings(settings)
+        .map_err(|error| error.to_string())?;
+    notify();
+    serde_json::to_string(&credentials)
+        .map(Zeroizing::new)
+        .map_err(|_| "Could not encode AWS credentials".into())
+}
+
+pub fn begin_aws_login(
+    controller: Arc<Mutex<Controller>>,
+    notify: Arc<dyn Fn() + Send + Sync>,
+) -> Result<(), String> {
+    let (broker, settings) = controller
+        .lock()
+        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .prepare_aws_login()
+        .map_err(|error| error.to_string())?;
+    notify();
+    let login_controller = Arc::clone(&controller);
+    let login_notify = Arc::clone(&notify);
+    let spawn_result = thread::Builder::new()
+        .name("secretd-aws-login".into())
+        .spawn(move || {
+            let result = broker.operation().and_then(|_operation| {
+                run_aws_login(
+                    &broker,
+                    settings,
+                    Arc::clone(&login_controller),
+                    Arc::clone(&login_notify),
+                )
+            });
+            if let Err(error) = result {
+                if let Ok(mut controller) = login_controller.lock() {
+                    controller.complete_aws_login(Err(error.clone()));
+                }
+                login_notify();
+                eprintln!("secretd AWS login: {error}");
+            }
+        });
+    match spawn_result {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let message = format!("Could not start AWS SSO login: {error}");
+            if let Ok(mut controller) = controller.lock() {
+                controller.set_aws_login_status(AwsLoginStatus::Failed(message.clone()));
+            }
+            notify();
+            Err(message)
+        }
+    }
+}
+
+fn run_aws_login(
+    broker: &AwsBroker,
+    settings: AwsSettings,
+    controller: Arc<Mutex<Controller>>,
+    notify: Arc<dyn Fn() + Send + Sync>,
+) -> Result<(), String> {
+    let device_controller = Arc::clone(&controller);
+    let device_notify = Arc::clone(&notify);
+    let mut settings = match broker.login(settings, move |authorization| {
+        if let Ok(mut controller) = device_controller.lock() {
+            controller.set_aws_login_status(AwsLoginStatus::AwaitingUser(authorization));
+        }
+        device_notify();
+    }) {
+        Ok(settings) => settings,
+        Err(error) => {
+            if let Ok(mut controller) = controller.lock() {
+                controller.complete_aws_login(Err(error.clone()));
+            }
+            notify();
+            return Err(error);
+        }
+    };
+    controller
+        .lock()
+        .map_err(|_| "SecretD state is unavailable".to_string())?
+        .set_aws_login_status(AwsLoginStatus::Discovering);
+    notify();
+    let discovery = broker.discover_accounts(&mut settings);
+    let mut controller = controller
+        .lock()
+        .map_err(|_| "SecretD state is unavailable".to_string())?;
+    match discovery {
+        Ok(()) => controller.complete_aws_login(Ok(settings)),
+        Err(error) => controller.complete_aws_discovery_failure(&settings, error),
+    }
+    drop(controller);
+    notify();
+    Ok(())
+}
+
+fn read_request(connection: &mut TcpStream) -> Result<ClientRequest, String> {
     let mut bytes = Zeroizing::new(Vec::new());
     BufReader::new(connection)
         .take(MAX_REQUEST_BYTES + 1)

@@ -16,6 +16,9 @@ path = "src/bin/secretd.rs"
 
 [dependencies]
 aes-gcm = "0.10"
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
+aws-sdk-sso = "1"
+aws-sdk-ssooidc = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 egui = { version = "0.35", default-features = false, features = ["default_fonts"] }
@@ -42,6 +45,7 @@ serde_json = "1"
 sha2 = "0.10"
 subtle = "2"
 tray-icon = "0.24"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 uuid = { version = "1", features = ["v4"] }
 winit = { version = "0.30", default-features = false }
 zeroize = "1"

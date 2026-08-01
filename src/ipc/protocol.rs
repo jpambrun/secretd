@@ -9,16 +9,19 @@ pub struct EndpointFile {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct GetRequest {
+pub struct ClientRequest {
     pub version: u8,
     pub token: String,
     pub action: String,
-    pub secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     pub pid: u32,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct GetResponse {
+pub struct ClientResponse {
     pub ok: bool,
     pub value: Option<String>,
     pub error: Option<String>,

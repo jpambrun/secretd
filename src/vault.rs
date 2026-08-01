@@ -17,6 +17,7 @@ use sha2::Sha256;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::aws::AwsSettings;
 use crate::paths::ensure_parent;
 
 pub const VAULT_VERSION: u8 = 1;
@@ -64,6 +65,8 @@ struct VaultPlaintext {
     version: u8,
     revision: u64,
     secrets: BTreeMap<String, VaultEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    aws: Option<AwsSettings>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -131,6 +134,7 @@ impl VaultStore {
             version: VAULT_VERSION,
             revision: 0,
             secrets: BTreeMap::new(),
+            aws: None,
         };
         save_with(&self.path, &data, &key, &salt, PBKDF2_ITERATIONS)?;
         self.key = Some(key);
@@ -305,6 +309,18 @@ impl VaultStore {
         self.salt = Some(salt);
         self.iterations = PBKDF2_ITERATIONS;
         Ok(())
+    }
+
+    pub fn aws_settings(&self) -> Result<Option<AwsSettings>, VaultError> {
+        Ok(self.require_data()?.aws.clone())
+    }
+
+    pub fn save_aws_settings(&mut self, settings: AwsSettings) -> Result<(), VaultError> {
+        settings.validate().map_err(VaultError)?;
+        let data = self.require_data_mut()?;
+        data.aws = Some(settings);
+        data.revision = data.revision.saturating_add(1);
+        self.save()
     }
 
     fn require_data(&self) -> Result<&VaultPlaintext, VaultError> {
@@ -613,5 +629,47 @@ mod tests {
             Some("read-only")
         );
         assert_eq!(normalize_secret_group(" ").unwrap(), None);
+    }
+
+    #[test]
+    fn encrypts_aws_settings_with_the_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.json");
+        let mut vault = VaultStore::new(path.clone());
+        vault.create("correct horse").unwrap();
+        vault
+            .save_aws_settings(AwsSettings {
+                start_url: "https://example.awsapps.com/start".into(),
+                sso_region: "ca-central-1".into(),
+                targets: vec![crate::aws::AwsTarget {
+                    profile: "prod".into(),
+                    account_id: "123456789012".into(),
+                    read_only_role: "ReadOnly".into(),
+                    admin_role: "Administrator".into(),
+                    region: "ca-central-1".into(),
+                }],
+                discovered_accounts: vec![crate::aws::AwsDiscoveredAccount {
+                    account_id: "123456789012".into(),
+                    account_name: "Production".into(),
+                    email_address: "prod@example.com".into(),
+                    roles: vec!["ReadOnly".into(), "Administrator".into()],
+                }],
+                discovery_complete: true,
+                registration: None,
+                token: None,
+            })
+            .unwrap();
+        let encrypted = fs::read_to_string(&path).unwrap();
+        assert!(!encrypted.contains("example.awsapps.com"));
+        assert!(!encrypted.contains("123456789012"));
+        assert!(!encrypted.contains("Production"));
+        assert!(!encrypted.contains("prod@example.com"));
+        vault.lock();
+
+        let mut reopened = VaultStore::new(path);
+        reopened.unlock("correct horse").unwrap();
+        let settings = reopened.aws_settings().unwrap().unwrap();
+        assert_eq!(settings.targets[0].profile, "prod");
+        assert_eq!(settings.targets[0].admin_role, "Administrator");
     }
 }

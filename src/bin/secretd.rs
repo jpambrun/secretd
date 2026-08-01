@@ -6,7 +6,10 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-use secretd::{ipc::get_secret, paths::cli_runtime_path};
+use secretd::{
+    ipc::{get_aws_credentials, get_secret, start_aws_login},
+    paths::cli_runtime_path,
+};
 
 #[path = "../app.rs"]
 mod app;
@@ -19,6 +22,8 @@ mod runtime;
 enum Mode {
     Desktop { detach: bool },
     Get(String),
+    AwsCredentials(String),
+    AwsLogin,
     Help,
 }
 
@@ -38,6 +43,18 @@ fn main() {
         }
         Ok(Mode::Get(secret)) => {
             if let Err(error) = get(&secret) {
+                eprintln!("secretd: {error}");
+                std::process::exit(1);
+            }
+        }
+        Ok(Mode::AwsCredentials(profile)) => {
+            if let Err(error) = aws_credentials(&profile) {
+                eprintln!("secretd: {error}");
+                std::process::exit(1);
+            }
+        }
+        Ok(Mode::AwsLogin) => {
+            if let Err(error) = aws_login() {
                 eprintln!("secretd: {error}");
                 std::process::exit(1);
             }
@@ -64,6 +81,10 @@ fn mode(arguments: &[String]) -> Result<Mode, ()> {
             Ok(Mode::Desktop { detach: false })
         }
         [command, secret] if command == "get" => Ok(Mode::Get(secret.clone())),
+        [namespace, command, profile] if namespace == "aws" && command == "credentials" => {
+            Ok(Mode::AwsCredentials(profile.clone()))
+        }
+        [namespace, command] if namespace == "aws" && command == "login" => Ok(Mode::AwsLogin),
         [argument] if matches!(argument.as_str(), "--help" | "-h" | "help") => Ok(Mode::Help),
         _ => Err(()),
     }
@@ -97,6 +118,20 @@ fn get(secret: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+fn aws_credentials(profile: &str) -> Result<(), String> {
+    let value = get_aws_credentials(&cli_runtime_path()?, profile)?;
+    std::io::stdout()
+        .write_all(format!("{}\n", *value).as_bytes())
+        .map_err(|error| error.to_string())
+}
+
+fn aws_login() -> Result<(), String> {
+    let message = start_aws_login(&cli_runtime_path()?)?;
+    std::io::stdout()
+        .write_all(format!("{}\n", *message).as_bytes())
+        .map_err(|error| error.to_string())
+}
+
 fn usage(code: i32) -> ! {
     eprintln!(
         "Usage:
@@ -104,7 +139,10 @@ fn usage(code: i32) -> ! {
   secretd --show             Open the desktop window
   secretd desktop --foreground
                              Run attached for diagnostics
-  secretd get <secret-name>  Request a secret"
+  secretd get <secret-name>  Request a secret
+  secretd aws login          Start AWS IAM Identity Center login
+  secretd aws credentials <profile>
+                             AWS credential_process helper"
     );
     std::process::exit(code);
 }
@@ -141,6 +179,11 @@ mod tests {
             Ok(Mode::Get("service/token".into()))
         );
         assert_eq!(mode(&arguments(&["--help"])), Ok(Mode::Help));
+        assert_eq!(
+            mode(&arguments(&["aws", "credentials", "prod"])),
+            Ok(Mode::AwsCredentials("prod".into()))
+        );
+        assert_eq!(mode(&arguments(&["aws", "login"])), Ok(Mode::AwsLogin));
         assert_eq!(mode(&arguments(&["get"])), Err(()));
     }
 }

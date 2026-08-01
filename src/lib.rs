@@ -1,3 +1,4 @@
+pub mod aws;
 pub mod controller;
 pub mod grants;
 pub mod ipc;
