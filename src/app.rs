@@ -12,11 +12,13 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, Theme, ThemeRegistry,
+    TitleBar,
     badge::Badge,
-    button::{Button, ButtonGroup, ButtonVariants as _},
+    button::{Button, ButtonVariants as _},
     group_box::{GroupBox, GroupBoxVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
+    menu::{DropdownMenu as _, PopupMenuItem},
     radio::Radio,
     scroll::ScrollableElement as _,
     tab::{Tab, TabBar},
@@ -902,69 +904,83 @@ impl MainView {
             View::Grants => 2,
             View::Activity => 3,
         };
-        h_flex()
-            .w_full()
-            .min_h(px(64.))
-            .px_5()
-            .gap_3()
-            .items_center()
-            .bg(rgb(SURFACE))
-            .border_b_1()
-            .border_color(rgb(LINE))
-            .child(brand())
-            .child(status_pill("Vault unlocked", GREEN, GREEN_SOFT))
-            .child(div().w(px(12.)))
+        TitleBar::new()
             .child(
-                TabBar::new("main-navigation")
-                    .segmented()
-                    .small()
-                    .selected_index(selected_index)
-                    .on_click(move |index, _, cx| {
-                        let view = match index {
-                            0 => View::Secrets,
-                            1 => View::Aws,
-                            2 => View::Grants,
-                            _ => View::Activity,
-                        };
-                        entity.update(cx, |this, cx| this.switch_view(view, cx));
-                    })
-                    .child(Tab::new().label("Credentials"))
-                    .child(Tab::new().label("AWS SSO"))
+                h_flex()
+                    .w_full()
+                    .h_full()
+                    .pr_3()
+                    .gap_3()
+                    .items_center()
+                    .child(title_bar_brand())
+                    .child(status_pill("Vault unlocked", GREEN, GREEN_SOFT))
+                    .child(div().w(px(4.)))
                     .child(
-                        Tab::new()
-                            .aria_label(format!("Active, {active_count}"))
+                        TabBar::new("main-navigation")
+                            .segmented()
+                            .small()
+                            .selected_index(selected_index)
+                            .on_click(move |index, _, cx| {
+                                let view = match index {
+                                    0 => View::Secrets,
+                                    1 => View::Aws,
+                                    2 => View::Grants,
+                                    _ => View::Activity,
+                                };
+                                entity.update(cx, |this, cx| this.switch_view(view, cx));
+                            })
+                            .child(Tab::new().label("Credentials"))
+                            .child(Tab::new().label("AWS SSO"))
                             .child(
-                                Badge::new()
-                                    .count(active_count)
-                                    .max(999)
-                                    .color(badge_color)
-                                    .child(div().pr_1().child("Active")),
+                                Tab::new()
+                                    .aria_label(format!("Active, {active_count}"))
+                                    .child(
+                                        Badge::new()
+                                            .count(active_count)
+                                            .max(999)
+                                            .color(badge_color)
+                                            .child(
+                                                div()
+                                                    .when(active_count > 0, |this| this.pr_3())
+                                                    .child("Active"),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                Tab::new()
+                                    .aria_label(format!("Activity, {activity_count}"))
+                                    .child(
+                                        Badge::new()
+                                            .count(activity_count)
+                                            .max(999)
+                                            .color(badge_color)
+                                            .child(
+                                                div()
+                                                    .when(activity_count > 0, |this| this.pr_3())
+                                                    .child("Activity"),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("change-password")
+                            .ghost()
+                            .small()
+                            .label("Password")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_password(window, cx)),
                             ),
                     )
                     .child(
-                        Tab::new()
-                            .aria_label(format!("Activity, {activity_count}"))
-                            .child(
-                                Badge::new()
-                                    .count(activity_count)
-                                    .max(999)
-                                    .color(badge_color)
-                                    .child(div().pr_1().child("Activity")),
+                        Button::new("lock")
+                            .outline()
+                            .small()
+                            .label("Lock")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.lock_vault(window, cx)),
                             ),
                     ),
-            )
-            .child(div().flex_1())
-            .child(
-                Button::new("change-password")
-                    .ghost()
-                    .label("Password")
-                    .on_click(cx.listener(|this, _, window, cx| this.open_password(window, cx))),
-            )
-            .child(
-                Button::new("lock")
-                    .outline()
-                    .label("Lock")
-                    .on_click(cx.listener(|this, _, window, cx| this.lock_vault(window, cx))),
             )
             .into_any_element()
     }
@@ -1111,38 +1127,64 @@ impl MainView {
             .aws
             .as_ref()
             .is_some_and(|aws| !aws.discovered_accounts.is_empty());
-        let actions =
-            ButtonGroup::new("aws-actions")
-                .outline()
-                .small()
-                .disabled(login_in_progress)
-                .when(has_connection, |this| {
-                    this.child(
-                        Button::new("refresh-aws")
-                            .label(if login_in_progress {
-                                "Working…"
-                            } else {
-                                "Refresh"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| this.begin_aws_refresh(cx))),
-                    )
-                })
-                .when(has_discovered_accounts, |this| {
-                    this.child(Button::new("edit-aliases").label("Aliases").on_click(
-                        cx.listener(|this, _, window, cx| this.open_aws_aliases(window, cx)),
-                    ))
-                })
-                .child(
-                    Button::new("edit-aws-connection")
-                        .label(if has_connection {
-                            "Connection"
+        let entity = cx.entity();
+        let configure_entity = entity.clone();
+        let actions = h_flex()
+            .gap_2()
+            .when(has_connection, |this| {
+                this.child(
+                    Button::new("refresh-aws")
+                        .primary()
+                        .small()
+                        .label(if login_in_progress {
+                            "Working…"
                         } else {
-                            "Connect AWS"
+                            "Refresh"
                         })
+                        .disabled(login_in_progress)
+                        .on_click(cx.listener(|this, _, _, cx| this.begin_aws_refresh(cx))),
+                )
+                .child(
+                    Button::new("configure-aws")
+                        .outline()
+                        .small()
+                        .label("Configure")
+                        .disabled(login_in_progress)
+                        .dropdown_menu(move |menu, _, _| {
+                            let aliases_entity = configure_entity.clone();
+                            let connection_entity = configure_entity.clone();
+                            menu.when(has_discovered_accounts, |this| {
+                                this.item(PopupMenuItem::new("Profile aliases").on_click(
+                                    move |_, window, cx| {
+                                        aliases_entity.update(cx, |this, cx| {
+                                            this.open_aws_aliases(window, cx)
+                                        });
+                                    },
+                                ))
+                            })
+                            .item(
+                                PopupMenuItem::new("SSO connection").on_click(
+                                    move |_, window, cx| {
+                                        connection_entity.update(cx, |this, cx| {
+                                            this.open_aws_connection(window, cx)
+                                        });
+                                    },
+                                ),
+                            )
+                        }),
+                )
+            })
+            .when(!has_connection, |this| {
+                this.child(
+                    Button::new("edit-aws-connection")
+                        .primary()
+                        .small()
+                        .label("Connect AWS")
                         .on_click(
                             cx.listener(|this, _, window, cx| this.open_aws_connection(window, cx)),
                         ),
-                );
+                )
+            });
         let mut content = v_flex().gap_4().child(
             h_flex()
                 .items_start()
@@ -1701,10 +1743,26 @@ impl Render for MainView {
         }
         let snapshot = Self::snapshot(cx);
         if !snapshot.vault_exists || !snapshot.unlocked {
-            return div()
-                .relative()
+            return v_flex()
                 .size_full()
-                .child(self.render_auth(!snapshot.vault_exists, cx))
+                .bg(rgb(BACKGROUND))
+                .child(
+                    TitleBar::new().child(
+                        h_flex()
+                            .w_full()
+                            .h_full()
+                            .pr_3()
+                            .items_center()
+                            .child(title_bar_brand()),
+                    ),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .child(self.render_auth(!snapshot.vault_exists, cx)),
+                )
                 .into_any_element();
         }
         let content = match self.view {
@@ -2083,29 +2141,52 @@ impl Render for RequestView {
         };
         v_flex()
             .size_full()
-            .gap_4()
-            .p_6()
             .bg(rgb(BACKGROUND))
-            .child(brand())
+            .child(
+                TitleBar::new().child(
+                    h_flex()
+                        .w_full()
+                        .h_full()
+                        .pr_3()
+                        .gap_2()
+                        .items_center()
+                        .child(title_bar_brand())
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(MUTED))
+                                .child("Access request"),
+                        ),
+                ),
+            )
             .child(
                 v_flex()
-                    .gap_1()
+                    .id("request-content")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
+                    .gap_4()
+                    .p_6()
                     .child(
-                        div()
-                            .text_size(px(22.))
-                            .font_semibold()
-                            .child("Access request"),
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(22.))
+                                    .font_semibold()
+                                    .child("Access request"),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(MUTED))
+                                    .child("Review the requesting process before granting access"),
+                            ),
                     )
-                    .child(
-                        div()
-                            .text_color(rgb(MUTED))
-                            .child("Review the requesting process before granting access"),
-                    ),
+                    .when_some(self.error.clone(), |this, error| {
+                        this.child(error_banner(error))
+                    })
+                    .when_some(request, |this, request| this.child(request)),
             )
-            .when_some(self.error.clone(), |this, error| {
-                this.child(error_banner(error))
-            })
-            .when_some(request, |this, request| this.child(request))
             .into_any_element()
     }
 }
@@ -2184,6 +2265,27 @@ fn brand() -> gpui::AnyElement {
                         .child("LOCAL ENCRYPTED VAULT"),
                 ),
         )
+        .into_any_element()
+}
+
+fn title_bar_brand() -> gpui::AnyElement {
+    h_flex()
+        .gap_2()
+        .items_center()
+        .child(
+            div()
+                .size(px(24.))
+                .rounded(px(7.))
+                .bg(rgb(INK))
+                .text_color(rgb(SURFACE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(12.))
+                .font_semibold()
+                .child("S"),
+        )
+        .child(div().font_semibold().text_size(px(15.)).child("secretd"))
         .into_any_element()
 }
 

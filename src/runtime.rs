@@ -8,7 +8,7 @@ use gpui::{
     App, AppContext as _, Bounds, Entity, Global, KeyBinding, QuitMode, WeakEntity, WindowBounds,
     WindowHandle, WindowKind, WindowOptions, actions, px, size,
 };
-use gpui_component::Root;
+use gpui_component::{Root, TitleBar};
 
 use crate::app::{AppEvent, AppState, MainView, RequestView, configure_theme, deny_oldest_request};
 
@@ -227,6 +227,7 @@ pub(crate) fn open_main(cx: &mut App) {
     );
     let mut view_entity: Option<Entity<MainView>> = None;
     let options = WindowOptions {
+        titlebar: Some(TitleBar::title_bar_options()),
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(720.), px(520.))),
         ..Default::default()
@@ -275,6 +276,7 @@ fn open_request(cx: &mut App) {
     );
     let options = WindowOptions {
         kind: WindowKind::PopUp,
+        titlebar: Some(TitleBar::title_bar_options()),
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(560.), px(460.))),
         ..Default::default()
