@@ -30,6 +30,10 @@ standalone `dist/bin/secretd` with:
 just package-macos
 ```
 
+Tagged releases publish Linux x86-64 and macOS archives on the
+[GitHub releases page](https://github.com/jpambrun/secretd/releases). The Linux build requires GTK 3,
+Ayatana AppIndicator, xdo, Wayland, and XKB runtime libraries from the host distribution.
+
 The vault uses PBKDF2-HMAC-SHA-256 with 600,000 iterations and AES-256-GCM. Secret names and values
 are encrypted together. Temporary grants and activity history exist only in memory.
 
