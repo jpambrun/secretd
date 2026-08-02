@@ -1,10 +1,9 @@
-use std::{
-    net::TcpStream,
-    process::{Command, Stdio},
-};
+use std::net::TcpStream;
 
 #[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "macos")]
+use std::process::{Command, Stdio};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessIdentity {
