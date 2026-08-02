@@ -484,71 +484,47 @@ impl SecretDApp {
     }
 
     fn workspace_ui(&mut self, ui: &mut egui::Ui, snapshot: AppSnapshot) {
+        let mut lock_requested = false;
+        let mut password_requested = false;
         Frame::new()
             .fill(SURFACE)
             .stroke(Stroke::new(1.0, LINE))
-            .inner_margin(Margin::symmetric(28, 16))
+            .inner_margin(Margin::symmetric(22, 10))
             .show(ui, |ui| {
+                let single_row = ui.available_width() >= 900.0;
                 ui.horizontal(|ui| {
                     brand_mark(ui);
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("secretd").size(18.0).strong().color(INK));
-                        ui.label(RichText::new("Local credential vault").small().color(MUTED));
-                    });
+                    ui.label(RichText::new("secretd").size(18.0).strong().color(INK));
                     status_pill(ui, "Vault unlocked", GREEN, GREEN_SOFT);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if secondary_button(ui, "Lock").clicked() {
-                            self.lock();
-                        }
-                        if secondary_button(ui, "Change password").clicked() {
-                            self.password_draft = Some(PasswordDraft {
-                                password: Zeroizing::new(String::new()),
-                                confirmation: Zeroizing::new(String::new()),
-                            });
-                            self.form_error = None;
-                        }
+                    if single_row {
+                        ui.add_space(10.0);
+                        workspace_nav(ui, &mut self.view, &snapshot);
+                        (password_requested, lock_requested) = workspace_actions(ui);
+                    }
+                });
+                if !single_row {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        workspace_nav(ui, &mut self.view, &snapshot);
+                        (password_requested, lock_requested) = workspace_actions(ui);
                     });
-                });
-                ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    nav_button(
-                        ui,
-                        &mut self.view,
-                        View::Secrets,
-                        "Credentials",
-                        snapshot.secrets.len(),
-                    );
-                    nav_button(
-                        ui,
-                        &mut self.view,
-                        View::Aws,
-                        "AWS SSO",
-                        snapshot
-                            .aws
-                            .as_ref()
-                            .map_or(0, |aws| aws.configuration.targets.len()),
-                    );
-                    nav_button(
-                        ui,
-                        &mut self.view,
-                        View::Grants,
-                        "Active access",
-                        snapshot.grants.len() + snapshot.aws_grants.len(),
-                    );
-                    nav_button(
-                        ui,
-                        &mut self.view,
-                        View::Activity,
-                        "Activity",
-                        snapshot.audit.len(),
-                    );
-                });
+                }
             });
+        if lock_requested {
+            self.lock();
+        }
+        if password_requested {
+            self.password_draft = Some(PasswordDraft {
+                password: Zeroizing::new(String::new()),
+                confirmation: Zeroizing::new(String::new()),
+            });
+            self.form_error = None;
+        }
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 Frame::new()
-                    .inner_margin(Margin::symmetric(36, 30))
+                    .inner_margin(Margin::symmetric(28, 22))
                     .show(ui, |ui| match self.view {
                         View::Secrets => self.secrets_ui(ui, &snapshot),
                         View::Aws => self.aws_ui(ui, &snapshot),
@@ -702,53 +678,71 @@ impl SecretDApp {
     }
 
     fn aws_ui(&mut self, ui: &mut egui::Ui, snapshot: &AppSnapshot) {
-        section_header(
-            ui,
-            "AWS IAM Identity Center",
-            "Sign in first, then turn discovered AWS accounts into local profiles.",
-        );
         let login_in_progress = matches!(
             snapshot.aws_login,
             AwsLoginStatus::Starting
                 | AwsLoginStatus::AwaitingUser(_)
                 | AwsLoginStatus::Discovering
         );
+        let mut edit_connection = false;
+        let mut edit_aliases = false;
+        let mut refresh_accounts = false;
         ui.horizontal(|ui| {
-            let edit = ui.add_enabled_ui(!login_in_progress, |ui| {
-                secondary_button(
-                    ui,
-                    if snapshot.aws.is_some() {
-                        "Change connection"
-                    } else {
-                        "Connect AWS"
-                    },
-                )
+            ui.vertical(|ui| {
+                ui.label(RichText::new("AWS profiles").size(24.0).strong().color(INK));
+                ui.label(
+                    RichText::new("IAM Identity Center accounts and role mappings.")
+                        .size(13.0)
+                        .color(MUTED),
+                );
             });
-            if edit.inner.clicked() {
-                self.aws_draft = Some(aws_connection_draft(snapshot));
-                self.form_error = None;
-            }
-            if snapshot
-                .aws
-                .as_ref()
-                .is_some_and(|aws| !aws.discovered_accounts.is_empty())
-                && !login_in_progress
-                && secondary_button(ui, "Manage aliases").clicked()
-            {
-                self.aws_draft = Some(aws_alias_draft(snapshot));
-                self.form_error = None;
-            }
-            if snapshot.aws.is_some()
-                && !login_in_progress
-                && primary_button(ui, "Sign in and refresh accounts").clicked()
-            {
-                match begin_aws_login(Arc::clone(&self.controller), Arc::clone(&self.notify)) {
-                    Ok(()) => self.toast("AWS SSO login started", false),
-                    Err(error) => self.toast(error, true),
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if snapshot.aws.is_some() {
+                    refresh_accounts = ui
+                        .add_enabled_ui(!login_in_progress, |ui| primary_button(ui, "Refresh"))
+                        .inner
+                        .clicked();
                 }
-            }
+                if snapshot
+                    .aws
+                    .as_ref()
+                    .is_some_and(|aws| !aws.discovered_accounts.is_empty())
+                {
+                    edit_aliases = ui
+                        .add_enabled_ui(!login_in_progress, |ui| secondary_button(ui, "Aliases"))
+                        .inner
+                        .clicked();
+                }
+                edit_connection = ui
+                    .add_enabled_ui(!login_in_progress, |ui| {
+                        secondary_button(
+                            ui,
+                            if snapshot.aws.is_some() {
+                                "Connection"
+                            } else {
+                                "Connect AWS"
+                            },
+                        )
+                    })
+                    .inner
+                    .clicked();
+            });
         });
-        ui.add_space(14.0);
+        if edit_connection {
+            self.aws_draft = Some(aws_connection_draft(snapshot));
+            self.form_error = None;
+        }
+        if edit_aliases {
+            self.aws_draft = Some(aws_alias_draft(snapshot));
+            self.form_error = None;
+        }
+        if refresh_accounts {
+            match begin_aws_login(Arc::clone(&self.controller), Arc::clone(&self.notify)) {
+                Ok(()) => self.toast("AWS SSO login started", false),
+                Err(error) => self.toast(error, true),
+            }
+        }
+        ui.add_space(10.0);
 
         match &snapshot.aws_login {
             AwsLoginStatus::Starting => {
@@ -813,32 +807,38 @@ impl SecretDApp {
             empty_state(ui, "Step 1 · Enter your AWS access portal URL to begin");
             return;
         };
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Encrypted SSO connection")
-                    .strong()
-                    .color(INK),
-            );
-            status_pill(
-                ui,
-                if aws.logged_in {
-                    "Session available"
-                } else {
-                    "Sign-in required"
-                },
-                if aws.logged_in { GREEN } else { AMBER },
-                SURFACE_MUTED,
-            );
-        });
-        ui.label(
-            RichText::new(format!(
-                "{} · {}",
-                aws.configuration.start_url, aws.configuration.sso_region
-            ))
-            .small()
-            .color(MUTED),
-        );
-        ui.add_space(12.0);
+        Frame::new()
+            .fill(SURFACE)
+            .stroke(Stroke::new(1.0, LINE))
+            .corner_radius(12)
+            .inner_margin(Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("SSO connection").strong().color(INK));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        status_pill(
+                            ui,
+                            if aws.logged_in {
+                                "Available"
+                            } else {
+                                "Sign in"
+                            },
+                            if aws.logged_in { GREEN } else { AMBER },
+                            SURFACE_MUTED,
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · {}",
+                                aws.configuration.start_url, aws.configuration.sso_region
+                            ))
+                            .small()
+                            .color(MUTED),
+                        );
+                    });
+                });
+            });
+        ui.add_space(10.0);
         if !aws.discovery_complete {
             Frame::new()
                 .fill(SURFACE)
@@ -862,62 +862,29 @@ impl SecretDApp {
             return;
         }
         ui.horizontal(|ui| {
+            ui.label(RichText::new("Profiles").size(18.0).strong().color(INK));
             ui.label(
                 RichText::new(format!(
-                    "{} AWS accounts discovered",
+                    "{} configured · {} discovered",
+                    aws.configuration.targets.len(),
                     aws.discovered_accounts.len()
                 ))
-                .strong()
-                .color(INK),
+                .small()
+                .color(MUTED),
             );
             if aws.configuration.targets.is_empty() {
                 status_pill(ui, "Aliases required", AMBER, SURFACE_MUTED);
             }
         });
-        ui.label(
-            RichText::new("Assign an alias to expose an account as an AWS profile.")
-                .small()
-                .color(MUTED),
-        );
         if aws.configuration.targets.is_empty()
             && primary_button(ui, "Assign profile aliases").clicked()
         {
             self.aws_draft = Some(aws_alias_draft(snapshot));
             self.form_error = None;
         }
-        ui.add_space(12.0);
-        for target in &aws.configuration.targets {
-            Frame::new()
-                .fill(SURFACE)
-                .stroke(Stroke::new(1.0, LINE))
-                .corner_radius(14)
-                .inner_margin(Margin::same(16))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(&target.profile)
-                                .size(16.0)
-                                .strong()
-                                .color(INK),
-                        );
-                        ui.label(RichText::new(&target.account_id).monospace().color(MUTED));
-                    });
-                    ui.label(
-                        RichText::new(format!(
-                            "Read-only: {} · Admin: {}{}",
-                            target.read_only_role,
-                            target.admin_role,
-                            if target.region.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" · {}", target.region)
-                            }
-                        ))
-                        .small()
-                        .color(MUTED),
-                    );
-                });
-            ui.add_space(8.0);
+        ui.add_space(8.0);
+        if !aws.configuration.targets.is_empty() {
+            aws_profile_cards(ui, &aws.configuration.targets);
         }
     }
 
@@ -1827,6 +1794,66 @@ fn section_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     ui.add_space(18.0);
 }
 
+fn aws_profile_grid_columns(available_width: f32) -> usize {
+    const MIN_CARD_WIDTH: f32 = 420.0;
+    const GAP: f32 = 10.0;
+    (((available_width + GAP) / (MIN_CARD_WIDTH + GAP)).floor() as usize).clamp(1, 3)
+}
+
+fn aws_profile_cards(ui: &mut egui::Ui, targets: &[AwsTarget]) {
+    let gap = 10.0;
+    let columns = aws_profile_grid_columns(ui.available_width());
+    for row in targets.chunks(columns) {
+        ui.columns(columns, |column_uis| {
+            for (column, target) in row.iter().enumerate() {
+                let width = column_uis[column].available_width();
+                aws_profile_card(&mut column_uis[column], target, width);
+            }
+        });
+        ui.add_space(gap);
+    }
+}
+
+fn aws_profile_card(ui: &mut egui::Ui, target: &AwsTarget, width: f32) {
+    Frame::new()
+        .fill(SURFACE)
+        .stroke(Stroke::new(1.0, LINE))
+        .corner_radius(12)
+        .inner_margin(Margin::symmetric(14, 11))
+        .show(ui, |ui| {
+            ui.set_width((width - 28.0).max(0.0));
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(&target.profile)
+                        .size(15.0)
+                        .strong()
+                        .color(INK),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if !target.region.is_empty() {
+                        ui.label(RichText::new(&target.region).small().color(MUTED));
+                        ui.label(RichText::new("·").small().color(LINE_STRONG));
+                    }
+                    ui.label(
+                        RichText::new(&target.account_id)
+                            .small()
+                            .monospace()
+                            .color(MUTED),
+                    );
+                });
+            });
+            ui.add_space(5.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(RichText::new("Read-only").small().strong().color(GREEN));
+                ui.label(RichText::new(&target.read_only_role).small().color(MUTED));
+                ui.label(RichText::new("·").small().color(LINE_STRONG));
+                ui.label(RichText::new("Admin").small().strong().color(AMBER));
+                ui.label(RichText::new(&target.admin_role).small().color(MUTED));
+            });
+        });
+}
+
 fn empty_state(ui: &mut egui::Ui, title: &str) {
     let inner_width = (ui.available_width() - 64.0).max(0.0);
     Frame::new()
@@ -1992,6 +2019,44 @@ fn admin_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
             .corner_radius(10)
             .min_size(egui::vec2(0.0, 38.0)),
     )
+}
+
+fn workspace_nav(ui: &mut egui::Ui, view: &mut View, snapshot: &AppSnapshot) {
+    nav_button(
+        ui,
+        view,
+        View::Secrets,
+        "Credentials",
+        snapshot.secrets.len(),
+    );
+    nav_button(
+        ui,
+        view,
+        View::Aws,
+        "AWS SSO",
+        snapshot
+            .aws
+            .as_ref()
+            .map_or(0, |aws| aws.configuration.targets.len()),
+    );
+    nav_button(
+        ui,
+        view,
+        View::Grants,
+        "Active access",
+        snapshot.grants.len() + snapshot.aws_grants.len(),
+    );
+    nav_button(ui, view, View::Activity, "Activity", snapshot.audit.len());
+}
+
+fn workspace_actions(ui: &mut egui::Ui) -> (bool, bool) {
+    let mut password = false;
+    let mut lock = false;
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        lock = secondary_button(ui, "Lock").clicked();
+        password = secondary_button(ui, "Password").clicked();
+    });
+    (password, lock)
 }
 
 fn nav_button(ui: &mut egui::Ui, view: &mut View, target: View, label: &str, count: usize) {
@@ -2573,6 +2638,49 @@ mod tests {
         assert_eq!(finite_combo_width(f32::INFINITY, 100.0), 120.0);
         assert_eq!(finite_combo_width(f32::NAN, 160.0), 160.0);
         assert_eq!(finite_combo_width(240.0, 100.0), 240.0);
+    }
+
+    #[test]
+    fn aws_profile_grid_uses_available_horizontal_space() {
+        assert_eq!(aws_profile_grid_columns(400.0), 1);
+        assert_eq!(aws_profile_grid_columns(850.0), 2);
+        assert_eq!(aws_profile_grid_columns(1_280.0), 3);
+        assert_eq!(aws_profile_grid_columns(2_000.0), 3);
+    }
+
+    #[test]
+    fn aws_profile_rows_stay_compact() {
+        let context = egui::Context::default();
+        configure_style(&context);
+        let target = AwsTarget {
+            profile: "demonstration-newvue-ai".into(),
+            account_id: "123456789012".into(),
+            read_only_role: "ReadOnlyAccess".into(),
+            admin_role: "AdministratorAccess".into(),
+            region: "us-east-2".into(),
+        };
+        let targets = vec![target; 7];
+        let mut used_height = 0.0;
+        let mut available_width = 0.0;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1_300.0, 800.0),
+            )),
+            ..Default::default()
+        };
+
+        let _ = context.run_ui(input, |ui| {
+            available_width = ui.available_width();
+            let top = ui.cursor().top();
+            aws_profile_cards(ui, &targets);
+            used_height = ui.cursor().top() - top;
+        });
+
+        assert!(
+            used_height <= 420.0,
+            "profile rows used {used_height}px at {available_width}px wide"
+        );
     }
 
     #[test]
