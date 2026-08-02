@@ -265,11 +265,29 @@ impl MainView {
                 .masked(true)
         });
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search credentials…"));
-        let _subscriptions = vec![cx.subscribe_in(&search, window, |_, _, event, _, cx| {
-            if matches!(event, InputEvent::Change) {
-                cx.notify();
-            }
-        })];
+        let _subscriptions = vec![
+            cx.subscribe_in(&search, window, |_, _, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&auth_password, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    if Self::snapshot(cx).vault_exists {
+                        this.submit_auth_form(window, cx);
+                    } else {
+                        this.auth_confirmation.update(cx, |input, cx| {
+                            input.focus(window, cx);
+                        });
+                    }
+                }
+            }),
+            cx.subscribe_in(&auth_confirmation, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.submit_auth_form(window, cx);
+                }
+            }),
+        ];
         Self {
             view: View::Secrets,
             auth_password,
@@ -365,6 +383,10 @@ impl MainView {
     }
 
     fn submit_auth(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_auth_form(window, cx);
+    }
+
+    fn submit_auth_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let snapshot = Self::snapshot(cx);
         let creating = !snapshot.vault_exists;
         let password = Zeroizing::new(Self::input_value(&self.auth_password, cx));
