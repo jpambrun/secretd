@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     error::Error,
     sync::{Arc, Mutex, mpsc::Sender},
     time::{Duration, Instant},
@@ -15,6 +15,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
+    radio::Radio,
     scroll::ScrollableElement as _,
     v_flex,
 };
@@ -33,7 +34,7 @@ use secretd::{
     grants::DEFAULT_GRANT_SECONDS,
     ipc::{RequestServer, begin_aws_login},
     paths::{default_runtime_path, default_vault_path},
-    process::{ProcessIdentity, is_launchd_process},
+    process::{ProcessIdentity, is_launchd_process, same_process},
 };
 
 use crate::icon::{TrayStatus, tray_icon};
@@ -1404,53 +1405,60 @@ impl MainView {
                 .into_any_element(),
             Modal::AwsAliases => v_flex()
                 .gap_4()
-                .max_h(px(650.))
+                .h(px(580.))
+                .overflow_hidden()
                 .child(modal_title("Assign AWS profile aliases"))
                 .child(
-                    v_flex()
-                        .id("aws-alias-list")
-                        .gap_3()
-                        .overflow_y_scrollbar()
-                        .children(self.aws_aliases.iter().map(|account| {
-                            card()
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .font_semibold()
-                                                .child(account.account_name.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .font_family("monospace")
-                                                .text_color(rgb(MUTED))
-                                                .child(account.account_id.clone()),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(12.))
-                                        .text_color(rgb(MUTED))
-                                        .child(account.email_address.clone()),
-                                )
-                                .child(field("Local profile alias", Input::new(&account.profile)))
-                                .child(
-                                    h_flex()
-                                        .gap_3()
-                                        .child(div().flex_1().child(field(
-                                            "Read-only role",
-                                            Input::new(&account.read_only_role),
-                                        )))
-                                        .child(div().flex_1().child(field(
-                                            "Admin role",
-                                            Input::new(&account.admin_role),
-                                        ))),
-                                )
-                                .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(
-                                    format!("Available roles: {}", account.roles.join(", ")),
-                                ))
-                        })),
+                    div().flex_1().min_h_0().overflow_hidden().child(
+                        v_flex()
+                            .id("aws-alias-list")
+                            .size_full()
+                            .gap_3()
+                            .overflow_y_scrollbar()
+                            .children(self.aws_aliases.iter().map(|account| {
+                                card()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .font_semibold()
+                                                    .child(account.account_name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family("monospace")
+                                                    .text_color(rgb(MUTED))
+                                                    .child(account.account_id.clone()),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(rgb(MUTED))
+                                            .child(account.email_address.clone()),
+                                    )
+                                    .child(field(
+                                        "Local profile alias",
+                                        Input::new(&account.profile),
+                                    ))
+                                    .child(
+                                        h_flex()
+                                            .gap_3()
+                                            .child(div().flex_1().child(field(
+                                                "Read-only role",
+                                                Input::new(&account.read_only_role),
+                                            )))
+                                            .child(div().flex_1().child(field(
+                                                "Admin role",
+                                                Input::new(&account.admin_role),
+                                            ))),
+                                    )
+                                    .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(
+                                        format!("Available roles: {}", account.roles.join(", ")),
+                                    ))
+                            })),
+                    ),
                 )
                 .when_some(self.form_error.clone(), |this, error| {
                     this.child(error_banner(error))
@@ -1490,6 +1498,7 @@ impl MainView {
             }
         };
         div()
+            .id("modal-overlay")
             .absolute()
             .inset_0()
             .flex()
@@ -1499,6 +1508,8 @@ impl MainView {
             .occlude()
             .child(
                 div()
+                    .id("modal-panel")
+                    .occlude()
                     .w(px(match modal {
                         Modal::AwsAliases => 700.,
                         _ => 500.,
@@ -1585,11 +1596,15 @@ impl Render for MainView {
 
 pub struct RequestView {
     error: Option<String>,
+    grant_process_choices: HashMap<String, ProcessIdentity>,
 }
 
 impl RequestView {
     pub fn new() -> Self {
-        Self { error: None }
+        Self {
+            error: None,
+            grant_process_choices: HashMap::new(),
+        }
     }
 
     fn snapshot(cx: &App) -> AppSnapshot {
@@ -1614,6 +1629,9 @@ impl RequestView {
                     .respond(&id, decision, seconds, process)
                     .map_err(|error| error.to_string())
             });
+        if result.is_ok() {
+            self.grant_process_choices.remove(&id);
+        }
         self.error = result.err();
         (cx.global::<AppState>().notify())();
         cx.notify();
@@ -1636,9 +1654,38 @@ impl RequestView {
                     .respond_aws(&id, level, process, Some(DEFAULT_GRANT_SECONDS))
                     .map_err(|error| error.to_string())
             });
+        if result.is_ok() {
+            self.grant_process_choices.remove(&id);
+        }
         self.error = result.err();
         (cx.global::<AppState>().notify())();
         cx.notify();
+    }
+
+    fn select_grant_process(
+        &mut self,
+        request_id: String,
+        process: ProcessIdentity,
+        cx: &mut Context<Self>,
+    ) {
+        self.grant_process_choices.insert(request_id, process);
+        cx.notify();
+    }
+
+    fn grant_process(
+        &self,
+        request_id: &str,
+        process_tree: &[ProcessIdentity],
+    ) -> Option<ProcessIdentity> {
+        self.grant_process_choices
+            .get(request_id)
+            .filter(|selected| {
+                process_tree
+                    .iter()
+                    .any(|process| same_process(selected, process))
+            })
+            .cloned()
+            .or_else(|| default_grant_process(process_tree))
     }
 
     fn render_secret(
@@ -1648,7 +1695,7 @@ impl RequestView {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let entity = cx.entity();
-        let process = default_grant_process(&request.process_tree);
+        let process = self.grant_process(&request.id, &request.process_tree);
         let deny_id = request.id.clone();
         let once_id = request.id.clone();
         let grant_id = request.id.clone();
@@ -1680,7 +1727,13 @@ impl RequestView {
                         SURFACE_MUTED,
                     )),
             )
-            .child(process_tree(&request.process_tree))
+            .child(process_grant_selector(
+                &request.id,
+                &request.process_tree,
+                process.as_ref(),
+                request.verified,
+                entity.clone(),
+            ))
             .child(
                 h_flex()
                     .gap_2()
@@ -1754,7 +1807,7 @@ impl RequestView {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let entity = cx.entity();
-        let process = default_grant_process(&request.process_tree);
+        let process = self.grant_process(&request.id, &request.process_tree);
         let deny_id = request.id.clone();
         let read_id = request.id.clone();
         let admin_id = request.id.clone();
@@ -1777,7 +1830,13 @@ impl RequestView {
                             .child(format!("Profile: {}", request.profile)),
                     ),
             )
-            .child(process_tree(&request.process_tree))
+            .child(process_grant_selector(
+                &request.id,
+                &request.process_tree,
+                process.as_ref(),
+                request.verified,
+                entity.clone(),
+            ))
             .child(
                 h_flex()
                     .gap_2()
@@ -2094,32 +2153,114 @@ fn action_button(
         })
 }
 
-fn process_tree(processes: &[ProcessIdentity]) -> gpui::AnyElement {
+fn process_grant_selector(
+    request_id: &str,
+    processes: &[ProcessIdentity],
+    selected: Option<&ProcessIdentity>,
+    enabled: bool,
+    entity: Entity<RequestView>,
+) -> gpui::AnyElement {
+    let grantable = processes
+        .iter()
+        .filter(|process| !is_launchd_process(process))
+        .rev()
+        .collect::<Vec<_>>();
+    let requester = processes
+        .iter()
+        .find(|process| !is_launchd_process(process));
     v_flex()
         .gap_2()
         .child(
-            div()
-                .text_size(px(11.))
-                .font_semibold()
-                .text_color(rgb(MUTED))
-                .child("REQUESTING PROCESS TREE"),
+            v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_semibold()
+                        .child(if enabled {
+                            "Grant boundary"
+                        } else {
+                            "Requesting process"
+                        }),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED))
+                        .child(if enabled {
+                            "Choose which process and its children may reuse this access."
+                        } else {
+                            "This process chain is informational because access can only be allowed once."
+                        }),
+                ),
         )
-        .children(processes.iter().map(|process| {
-            div()
+        .child(
+            v_flex()
+                .gap_1()
                 .p_2()
-                .rounded(px(8.))
+                .rounded(px(10.))
+                .border_1()
+                .border_color(rgb(LINE))
                 .bg(rgb(SURFACE_MUTED))
-                .font_family("monospace")
-                .text_size(px(12.))
-                .child(format!("PID {} · {}", process.pid, process.command))
-        }))
+                .children(grantable.into_iter().enumerate().map(|(depth, process)| {
+                    let process = process.clone();
+                    let request_id = request_id.to_string();
+                    let radio_id = format!("grant-process-{request_id}-{}", process.pid);
+                    let is_requester = requester.is_some_and(|value| same_process(value, &process));
+                    let is_selected = selected.is_some_and(|value| same_process(value, &process));
+                    let entity = entity.clone();
+                    h_flex()
+                        .gap_2()
+                        .pl(px(depth as f32 * 16.))
+                        .child(
+                            Radio::new(radio_id)
+                                .checked(is_selected)
+                                .disabled(!enabled)
+                                .label(format!("PID {} · {}", process.pid, process.command))
+                                .on_click(move |checked, _, cx| {
+                                    if *checked {
+                                        entity.update(cx, |this, cx| {
+                                            this.select_grant_process(
+                                                request_id.clone(),
+                                                process.clone(),
+                                                cx,
+                                            )
+                                        });
+                                    }
+                                }),
+                        )
+                        .when(is_requester, |this| {
+                            this.child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(GREEN))
+                                    .child("requester"),
+                            )
+                        })
+                })),
+        )
+        .when_some(selected.filter(|_| enabled), |this, selected| {
+            let name = selected
+                .executable
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&selected.executable);
+            this.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(GREEN))
+                    .child(format!(
+                        "Access will follow {name} and its child processes."
+                    )),
+            )
+        })
         .into_any_element()
 }
 
 fn default_grant_process(process_tree: &[ProcessIdentity]) -> Option<ProcessIdentity> {
     process_tree
         .iter()
-        .rev()
         .find(|process| !is_launchd_process(process))
         .cloned()
         .or_else(|| process_tree.first().cloned())
@@ -2271,8 +2412,19 @@ pub fn configure_theme(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{suggested_alias, suggested_role};
+    use super::{default_grant_process, suggested_alias, suggested_role};
     use secretd::aws::AwsAccessLevel;
+    use secretd::process::ProcessIdentity;
+
+    fn process(pid: u32, executable: &str) -> ProcessIdentity {
+        ProcessIdentity {
+            pid,
+            ppid: pid.saturating_sub(1),
+            started_at: format!("started-{pid}"),
+            executable: executable.into(),
+            command: executable.into(),
+        }
+    }
 
     #[test]
     fn account_names_become_safe_profile_aliases() {
@@ -2291,5 +2443,15 @@ mod tests {
             suggested_role(&roles, AwsAccessLevel::Admin),
             "AdministratorAccess"
         );
+    }
+
+    #[test]
+    fn grant_boundary_defaults_to_the_requester_not_its_ancestor() {
+        let requester = process(30, "/usr/local/bin/aws");
+        let shell = process(20, "/bin/zsh");
+        let launchd = process(1, "/sbin/launchd");
+        let tree = vec![requester.clone(), shell, launchd];
+
+        assert_eq!(default_grant_process(&tree), Some(requester));
     }
 }
