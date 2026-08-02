@@ -16,28 +16,20 @@ path = "src/bin/secretd.rs"
 
 [dependencies]
 aes-gcm = "0.10"
+anyhow = "1"
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
 aws-sdk-sso = "1"
 aws-sdk-ssooidc = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-egui = { version = "0.35", default-features = false, features = ["default_fonts"] }
-egui-winit = { version = "0.35", default-features = false, features = [
-    "accesskit",
-    "clipboard",
-    "links",
-    "wayland",
-    "x11",
-] }
-egui_glow = { version = "0.35", default-features = false, features = [
-    "wayland",
-    "winit",
-    "x11",
-] }
 getrandom = "0.3"
-glow = "0.17"
-glutin = "0.32"
-glutin-winit = "0.5"
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
+    "font-kit",
+    "runtime_shaders",
+] }
 pbkdf2 = "0.12"
 png = "0.18"
 serde = { version = "1", features = ["derive"] }
@@ -47,11 +39,18 @@ subtle = "2"
 tray-icon = "0.24"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 uuid = { version = "1", features = ["v4"] }
-winit = { version = "0.30", default-features = false }
 zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSResponder",
+    "NSRunningApplication",
+] }
 
 [dev-dependencies]
 tempfile = "3"
