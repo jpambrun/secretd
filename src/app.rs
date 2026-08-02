@@ -424,6 +424,10 @@ impl MainView {
         cx.notify();
     }
 
+    pub fn show_aws_login(&mut self, cx: &mut Context<Self>) {
+        self.switch_view(View::Aws, cx);
+    }
+
     fn open_secret(
         &mut self,
         original_name: Option<String>,

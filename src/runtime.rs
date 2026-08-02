@@ -25,6 +25,7 @@ struct Windows {
     request: Option<WindowHandle<Root>>,
     request_view: Option<WeakEntity<RequestView>>,
     closing_request: bool,
+    opened_aws_login_url: Option<String>,
 }
 
 impl Global for Windows {}
@@ -152,16 +153,41 @@ fn dispatch(event: AppEvent, cx: &mut App) {
         AppEvent::StateChanged => {
             cx.global::<AppState>().refresh_tray();
             let snapshot = cx.global::<AppState>().snapshot();
-            if matches!(
-                snapshot.aws_login,
+            match snapshot.aws_login {
                 secretd::aws::AwsLoginStatus::Starting
-                    | secretd::aws::AwsLoginStatus::AwaitingUser(_)
-                    | secretd::aws::AwsLoginStatus::Discovering
-            ) {
-                open_main(cx);
+                | secretd::aws::AwsLoginStatus::Discovering => {
+                    cx.global_mut::<Windows>().opened_aws_login_url = None;
+                    show_aws_login(cx);
+                }
+                secretd::aws::AwsLoginStatus::AwaitingUser(authorization) => {
+                    show_aws_login(cx);
+                    let url = authorization
+                        .verification_uri_complete
+                        .unwrap_or(authorization.verification_uri);
+                    let should_open = {
+                        let windows = cx.global_mut::<Windows>();
+                        if windows.opened_aws_login_url.as_deref() == Some(url.as_str()) {
+                            false
+                        } else {
+                            windows.opened_aws_login_url = Some(url.clone());
+                            true
+                        }
+                    };
+                    if should_open {
+                        cx.open_url(&url);
+                    }
+                }
+                _ => cx.global_mut::<Windows>().opened_aws_login_url = None,
             }
         }
         AppEvent::Quit => cx.quit(),
+    }
+}
+
+fn show_aws_login(cx: &mut App) {
+    open_main(cx);
+    if let Some(view) = cx.global::<Windows>().main_view.clone() {
+        let _ = view.update(cx, |view, cx| view.show_aws_login(cx));
     }
 }
 
