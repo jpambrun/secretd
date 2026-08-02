@@ -13,7 +13,8 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, Theme, ThemeRegistry,
     badge::Badge,
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonGroup, ButtonVariants as _},
+    group_box::{GroupBox, GroupBoxVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
     radio::Radio,
@@ -1105,6 +1106,43 @@ impl MainView {
                 | AwsLoginStatus::AwaitingUser(_)
                 | AwsLoginStatus::Discovering
         );
+        let has_connection = snapshot.aws.is_some();
+        let has_discovered_accounts = snapshot
+            .aws
+            .as_ref()
+            .is_some_and(|aws| !aws.discovered_accounts.is_empty());
+        let actions =
+            ButtonGroup::new("aws-actions")
+                .outline()
+                .small()
+                .disabled(login_in_progress)
+                .when(has_connection, |this| {
+                    this.child(
+                        Button::new("refresh-aws")
+                            .label(if login_in_progress {
+                                "Working…"
+                            } else {
+                                "Refresh"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.begin_aws_refresh(cx))),
+                    )
+                })
+                .when(has_discovered_accounts, |this| {
+                    this.child(Button::new("edit-aliases").label("Aliases").on_click(
+                        cx.listener(|this, _, window, cx| this.open_aws_aliases(window, cx)),
+                    ))
+                })
+                .child(
+                    Button::new("edit-aws-connection")
+                        .label(if has_connection {
+                            "Connection"
+                        } else {
+                            "Connect AWS"
+                        })
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_aws_connection(window, cx)),
+                        ),
+                );
         let mut content = v_flex().gap_4().child(
             h_flex()
                 .items_start()
@@ -1113,49 +1151,7 @@ impl MainView {
                     "IAM Identity Center accounts and role mappings.",
                 ))
                 .child(div().flex_1())
-                .when(snapshot.aws.is_some(), |this| {
-                    this.child(
-                        Button::new("refresh-aws")
-                            .primary()
-                            .label(if login_in_progress {
-                                "Working…"
-                            } else {
-                                "Refresh"
-                            })
-                            .disabled(login_in_progress)
-                            .on_click(cx.listener(|this, _, _, cx| this.begin_aws_refresh(cx))),
-                    )
-                })
-                .when(
-                    snapshot
-                        .aws
-                        .as_ref()
-                        .is_some_and(|aws| !aws.discovered_accounts.is_empty()),
-                    |this| {
-                        this.child(
-                            Button::new("edit-aliases")
-                                .outline()
-                                .label("Aliases")
-                                .disabled(login_in_progress)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_aws_aliases(window, cx)
-                                })),
-                        )
-                    },
-                )
-                .child(
-                    Button::new("edit-aws-connection")
-                        .outline()
-                        .label(if snapshot.aws.is_some() {
-                            "Connection"
-                        } else {
-                            "Connect AWS"
-                        })
-                        .disabled(login_in_progress)
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.open_aws_connection(window, cx)),
-                        ),
-                ),
+                .child(actions),
         );
         content = match &snapshot.aws_login {
             AwsLoginStatus::Starting => {
@@ -1216,25 +1212,41 @@ impl MainView {
         };
         content
             .child(
-                card().child(
-                    h_flex()
-                        .gap_3()
-                        .child(div().font_semibold().child("SSO connection"))
-                        .child(div().flex_1())
-                        .child(div().text_color(rgb(MUTED)).child(format!(
-                            "{} · {}",
-                            aws.configuration.start_url, aws.configuration.sso_region
-                        )))
-                        .child(status_pill(
-                            if aws.logged_in {
-                                "Available"
-                            } else {
-                                "Sign in"
-                            },
-                            if aws.logged_in { GREEN } else { AMBER },
-                            SURFACE_MUTED,
-                        )),
-                ),
+                GroupBox::new()
+                    .id("aws-connection")
+                    .outline()
+                    .title(div().font_semibold().child("SSO connection"))
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .font_semibold()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .child(aws.configuration.start_url.clone()),
+                                    )
+                                    .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(
+                                        format!("Region · {}", aws.configuration.sso_region),
+                                    )),
+                            )
+                            .child(status_pill(
+                                if aws.logged_in {
+                                    "Available"
+                                } else {
+                                    "Sign in"
+                                },
+                                if aws.logged_in { GREEN } else { AMBER },
+                                SURFACE_MUTED,
+                            )),
+                    ),
             )
             .when(!aws.discovery_complete, |this| {
                 this.child(empty_state(
@@ -1260,20 +1272,69 @@ impl MainView {
                                 .child("Configured profiles"),
                         )
                         .children(aws.configuration.targets.iter().map(|target| {
-                            card().child(
-                                h_flex()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .font_semibold()
-                                            .font_family("monospace")
-                                            .child(target.profile.clone()),
-                                    )
-                                    .child(div().text_color(rgb(MUTED)).child(format!(
-                                        "Account {} · {} / {}",
-                                        target.account_id, target.read_only_role, target.admin_role
-                                    ))),
-                            )
+                            GroupBox::new()
+                                .id(SharedString::from(format!(
+                                    "aws-profile-{}",
+                                    target.profile
+                                )))
+                                .outline()
+                                .child(
+                                    h_flex()
+                                        .gap_3()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .size(px(36.))
+                                                .flex_shrink_0()
+                                                .rounded(px(10.))
+                                                .bg(rgb(SURFACE_MUTED))
+                                                .text_color(rgb(INK))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_size(px(11.))
+                                                .font_semibold()
+                                                .child("AWS"),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .font_semibold()
+                                                        .font_family("monospace")
+                                                        .child(target.profile.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(12.))
+                                                        .text_color(rgb(MUTED))
+                                                        .child(format!(
+                                                            "Account {}",
+                                                            target.account_id
+                                                        )),
+                                                ),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .flex_shrink_0()
+                                                .items_end()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .text_size(px(12.))
+                                                        .child(target.read_only_role.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(12.))
+                                                        .text_color(rgb(MUTED))
+                                                        .child(target.admin_role.clone()),
+                                                ),
+                                        ),
+                                )
                         })),
                 )
             })
@@ -1665,6 +1726,7 @@ impl Render for MainView {
                         div()
                             .id("main-scroll")
                             .flex_1()
+                            .min_h_0()
                             .overflow_y_scrollbar()
                             .child(div().p_7().child(content)),
                     ),
