@@ -2208,6 +2208,9 @@ fn process_grant_selector(
                     let radio_id = format!("grant-process-{request_id}-{}", process.pid);
                     let is_requester = requester.is_some_and(|value| same_process(value, &process));
                     let is_selected = selected.is_some_and(|value| same_process(value, &process));
+                    let process_label = compact_process_label(&process);
+                    let process_details = process_details(&process);
+                    let process_pid = process.pid;
                     let entity = entity.clone();
                     h_flex()
                         .gap_2()
@@ -2216,7 +2219,8 @@ fn process_grant_selector(
                             Radio::new(radio_id)
                                 .checked(is_selected)
                                 .disabled(!enabled)
-                                .label(format!("PID {} · {}", process.pid, process.command))
+                                .label(process_label)
+                                .tooltip(process_details)
                                 .on_click(move |checked, _, cx| {
                                     if *checked {
                                         entity.update(cx, |this, cx| {
@@ -2228,6 +2232,12 @@ fn process_grant_selector(
                                         });
                                     }
                                 }),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(MUTED))
+                                .child(format!("PID {process_pid}")),
                         )
                         .when(is_requester, |this| {
                             this.child(
@@ -2256,6 +2266,45 @@ fn process_grant_selector(
             )
         })
         .into_any_element()
+}
+
+fn compact_process_label(process: &ProcessIdentity) -> String {
+    let command = process.command.trim();
+    let source = if command.is_empty() {
+        process.executable.trim()
+    } else {
+        command
+    };
+    let mut parts = source.split_whitespace();
+    let executable = parts.next().unwrap_or(source);
+    let program = executable
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(executable);
+    let arguments = parts.collect::<Vec<_>>();
+    let mut label = program.to_string();
+    for argument in arguments.iter().take(2) {
+        let argument = argument.rsplit('/').next().unwrap_or(argument);
+        if label.chars().count() + argument.chars().count() + 1 > 42 {
+            label.push_str(" …");
+            return label;
+        }
+        label.push(' ');
+        label.push_str(argument);
+    }
+    if arguments.len() > 2 {
+        label.push_str(" …");
+    }
+    label
+}
+
+fn process_details(process: &ProcessIdentity) -> String {
+    if process.command.trim().is_empty() || process.command == process.executable {
+        process.executable.clone()
+    } else {
+        format!("{}\n{}", process.executable, process.command)
+    }
 }
 
 fn default_grant_process(process_tree: &[ProcessIdentity]) -> Option<ProcessIdentity> {
@@ -2412,7 +2461,7 @@ pub fn configure_theme(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_grant_process, suggested_alias, suggested_role};
+    use super::{compact_process_label, default_grant_process, suggested_alias, suggested_role};
     use secretd::aws::AwsAccessLevel;
     use secretd::process::ProcessIdentity;
 
@@ -2453,5 +2502,16 @@ mod tests {
         let tree = vec![requester.clone(), shell, launchd];
 
         assert_eq!(default_grant_process(&tree), Some(requester));
+    }
+
+    #[test]
+    fn process_labels_show_the_program_and_compact_arguments() {
+        let mut python = process(
+            30,
+            "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python",
+        );
+        python.command = format!("{} /opt/homebrew/bin/aws s3 ls", python.executable);
+
+        assert_eq!(compact_process_label(&python), "Python aws s3 …");
     }
 }
