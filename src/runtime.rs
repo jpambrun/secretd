@@ -5,8 +5,8 @@ use std::{
 };
 
 use gpui::{
-    App, AppContext as _, Bounds, Entity, Global, KeyBinding, QuitMode, Styled as _, WeakEntity,
-    WindowBounds, WindowHandle, WindowKind, WindowOptions, actions, px, size,
+    App, AppContext as _, Bounds, Entity, Global, KeyBinding, QuitMode, WeakEntity, WindowBounds,
+    WindowHandle, WindowKind, WindowOptions, actions, px, size,
 };
 use gpui_component::Root;
 
@@ -236,7 +236,7 @@ pub(crate) fn open_main(cx: &mut App) {
         window.on_window_should_close(cx, |_, _| true);
         let view = cx.new(|cx| MainView::new(window, cx));
         view_entity = Some(view.clone());
-        cx.new(|cx| Root::new(view, window, cx).bg(gpui::rgb(0xf5f7f5)))
+        cx.new(|cx| Root::new(view, window, cx))
     }) {
         Ok(handle) => {
             let windows = cx.global_mut::<Windows>();
@@ -284,7 +284,7 @@ fn open_request(cx: &mut App) {
         window.set_window_title("secretd access request");
         let view = cx.new(|_| RequestView::new());
         view_entity = Some(view.clone());
-        cx.new(|cx| Root::new(view, window, cx).bg(gpui::rgb(0xf5f7f5)))
+        cx.new(|cx| Root::new(view, window, cx))
     }) {
         Ok(handle) => {
             let windows = cx.global_mut::<Windows>();

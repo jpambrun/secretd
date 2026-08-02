@@ -6,17 +6,19 @@ use std::{
 };
 
 use gpui::{
-    App, AppContext, Context, Entity, Global, InteractiveElement as _, IntoElement,
+    App, AppContext, Context, Entity, Focusable as _, Global, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, div,
     prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
-    Disableable as _, Selectable as _, Sizable as _, StyledExt as _,
+    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, Theme, ThemeRegistry,
+    badge::Badge,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
     radio::Radio,
     scroll::ScrollableElement as _,
+    tab::{Tab, TabBar},
     v_flex,
 };
 use tray_icon::{
@@ -39,17 +41,73 @@ use secretd::{
 
 use crate::icon::{TrayStatus, tray_icon};
 
-const BACKGROUND: u32 = 0xf5f7f5;
-const SURFACE: u32 = 0xffffff;
-const SURFACE_MUTED: u32 = 0xf9faf9;
-const INK: u32 = 0x15211b;
-const MUTED: u32 = 0x637169;
-const LINE: u32 = 0xdae1dd;
-const GREEN: u32 = 0x148b5e;
-const GREEN_SOFT: u32 = 0xe6f5ed;
-const AMBER: u32 = 0xd89122;
-const RED: u32 = 0xca4343;
-const RED_SOFT: u32 = 0xfff1f1;
+const BACKGROUND: u32 = 0xe5e9ef;
+const SURFACE: u32 = 0xeff1f5;
+const SURFACE_MUTED: u32 = 0xdce0e8;
+const INK: u32 = 0x4c4f69;
+const MUTED: u32 = 0x7c7f93;
+const LINE: u32 = 0xccd0da;
+const GREEN: u32 = 0x5aa93b;
+const GREEN_SOFT: u32 = 0xe1eadc;
+const AMBER: u32 = 0xdf8e1d;
+const RED: u32 = 0xd26a53;
+const RED_SOFT: u32 = 0xf2d9d4;
+
+const CATPPUCCIN_LATTE_THEME: &str = r##"
+{
+  "name": "Catppuccin",
+  "author": "Catppuccino",
+  "url": "https://github.com/catppuccin/catppuccin",
+  "themes": [
+    {
+      "name": "Catppuccin Latte",
+      "mode": "light",
+      "colors": {
+        "accent.background": "#d3d8e0",
+        "accent.foreground": "#4c4f69",
+        "background": "#E5E9EF",
+        "border": "#CCD0DA",
+        "ring": "#7287fd",
+        "foreground": "#4c4f69",
+        "input.border": "#acb0be",
+        "link.active.foreground": "#7287fd",
+        "link.foreground": "#7287fd",
+        "link.hover.foreground": "#7287fd",
+        "list.active.background": "#7287fd22",
+        "list.active.border": "#7287fd",
+        "list.even.background": "#EFF1F5",
+        "list.head.background": "#dce0e8",
+        "muted.background": "#dce0e8",
+        "muted.foreground": "#9a9db2",
+        "panel.background": "#dce0e8",
+        "primary.active.background": "#7287fd",
+        "primary.background": "#7287fd",
+        "primary.foreground": "#EFF1F5",
+        "scrollbar.background": "#EFF1F500",
+        "scrollbar.thumb.background": "#acb0be",
+        "secondary.active.background": "#CCD2DE",
+        "secondary.background": "#dce0e8",
+        "secondary.foreground": "#4c4f69",
+        "secondary.hover.background": "#CCD2DE99",
+        "tab.active.background": "#E5E9EF",
+        "tab.active.foreground": "#4c4f69",
+        "tab.background": "#D2D7E200",
+        "tab.foreground": "#82848c",
+        "tab_bar.background": "#DCE0E8",
+        "title_bar.background": "#DCE0E8",
+        "title_bar.border": "#bec3d0",
+        "base.red": "#d26a53",
+        "base.green": "#5aa93b",
+        "base.yellow": "#df8e1d",
+        "base.blue": "#78acdc",
+        "base.magenta": "#8778dc",
+        "base.magenta.light": "#9978dc66",
+        "base.cyan": "#53d2b0"
+      }
+    }
+  ]
+}
+"##;
 
 #[derive(Clone, Copy, Debug)]
 pub enum AppEvent {
@@ -264,6 +322,12 @@ impl MainView {
                 .placeholder("Enter it again")
                 .masked(true)
         });
+        if !Self::snapshot(cx).unlocked {
+            let focus_handle = auth_password.focus_handle(cx);
+            window.defer(cx, move |window, cx| {
+                focus_handle.focus(window, cx);
+            });
+        }
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search credentials…"));
         let _subscriptions = vec![
             cx.subscribe_in(&search, window, |_, _, event, _, cx| {
@@ -828,6 +892,15 @@ impl MainView {
 
     fn render_header(&self, snapshot: &AppSnapshot, cx: &mut Context<Self>) -> gpui::AnyElement {
         let entity = cx.entity();
+        let active_count = snapshot.grants.len() + snapshot.aws_grants.len();
+        let activity_count = snapshot.audit.len();
+        let badge_color = cx.theme().muted_foreground;
+        let selected_index = match self.view {
+            View::Secrets => 0,
+            View::Aws => 1,
+            View::Grants => 2,
+            View::Activity => 3,
+        };
         h_flex()
             .w_full()
             .min_h(px(64.))
@@ -840,42 +913,45 @@ impl MainView {
             .child(brand())
             .child(status_pill("Vault unlocked", GREEN, GREEN_SOFT))
             .child(div().w(px(12.)))
-            .children([
-                nav_button("nav-secrets", "Credentials", self.view == View::Secrets, {
-                    let entity = entity.clone();
-                    move |_, _, cx| {
-                        entity.update(cx, |this, cx| this.switch_view(View::Secrets, cx));
-                    }
-                }),
-                nav_button("nav-aws", "AWS SSO", self.view == View::Aws, {
-                    let entity = entity.clone();
-                    move |_, _, cx| {
-                        entity.update(cx, |this, cx| this.switch_view(View::Aws, cx));
-                    }
-                }),
-                nav_button(
-                    "nav-grants",
-                    &format!(
-                        "Active ({})",
-                        snapshot.grants.len() + snapshot.aws_grants.len()
+            .child(
+                TabBar::new("main-navigation")
+                    .segmented()
+                    .small()
+                    .selected_index(selected_index)
+                    .on_click(move |index, _, cx| {
+                        let view = match index {
+                            0 => View::Secrets,
+                            1 => View::Aws,
+                            2 => View::Grants,
+                            _ => View::Activity,
+                        };
+                        entity.update(cx, |this, cx| this.switch_view(view, cx));
+                    })
+                    .child(Tab::new().label("Credentials"))
+                    .child(Tab::new().label("AWS SSO"))
+                    .child(
+                        Tab::new()
+                            .aria_label(format!("Active, {active_count}"))
+                            .child(
+                                Badge::new()
+                                    .count(active_count)
+                                    .max(999)
+                                    .color(badge_color)
+                                    .child(div().pr_1().child("Active")),
+                            ),
+                    )
+                    .child(
+                        Tab::new()
+                            .aria_label(format!("Activity, {activity_count}"))
+                            .child(
+                                Badge::new()
+                                    .count(activity_count)
+                                    .max(999)
+                                    .color(badge_color)
+                                    .child(div().pr_1().child("Activity")),
+                            ),
                     ),
-                    self.view == View::Grants,
-                    {
-                        let entity = entity.clone();
-                        move |_, _, cx| {
-                            entity.update(cx, |this, cx| this.switch_view(View::Grants, cx));
-                        }
-                    },
-                ),
-                nav_button(
-                    "nav-activity",
-                    &format!("Activity ({})", snapshot.audit.len()),
-                    self.view == View::Activity,
-                    move |_, _, cx| {
-                        entity.update(cx, |this, cx| this.switch_view(View::Activity, cx));
-                    },
-                ),
-            ])
+            )
             .child(div().flex_1())
             .child(
                 Button::new("change-password")
@@ -2148,19 +2224,6 @@ fn modal_actions(
         .into_any_element()
 }
 
-fn nav_button(
-    id: &'static str,
-    label: &str,
-    selected: bool,
-    click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> Button {
-    Button::new(id)
-        .ghost()
-        .selected(selected)
-        .label(label.to_string())
-        .on_click(click)
-}
-
 fn action_button(
     label: &'static str,
     id: String,
@@ -2471,18 +2534,19 @@ fn rebuild_tray_menu(menu: &Menu, snapshot: &AppSnapshot) -> tray_icon::menu::Re
 }
 
 pub fn configure_theme(cx: &mut App) {
-    let theme = gpui_component::Theme::global_mut(cx);
+    ThemeRegistry::global_mut(cx)
+        .load_themes_from_str(CATPPUCCIN_LATTE_THEME)
+        .expect("embedded Catppuccin Latte theme must be valid");
+    let latte = ThemeRegistry::global(cx)
+        .themes()
+        .get("Catppuccin Latte")
+        .cloned()
+        .expect("embedded Catppuccin Latte theme must be registered");
+    let theme = Theme::global_mut(cx);
+    theme.apply_config(&latte);
     theme.font_size = px(14.);
     theme.radius = px(8.);
     theme.radius_lg = px(14.);
-    theme.background = rgb(BACKGROUND).into();
-    theme.foreground = rgb(INK).into();
-    theme.border = rgb(LINE).into();
-    theme.primary = rgb(GREEN).into();
-    theme.primary_foreground = rgb(SURFACE).into();
-    theme.danger = rgb(RED).into();
-    theme.muted = rgb(SURFACE_MUTED).into();
-    theme.muted_foreground = rgb(MUTED).into();
 }
 
 #[cfg(test)]
