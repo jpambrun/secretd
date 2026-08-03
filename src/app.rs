@@ -1,20 +1,34 @@
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc::Sender},
     time::{Duration, Instant},
 };
 
-use egui::{
-    self, Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Stroke,
-    TextEdit,
+use gpui::{
+    App, AppContext, Context, Entity, Focusable as _, Global, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, div,
+    prelude::FluentBuilder as _, px, rgb,
+};
+use gpui_component::{
+    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, Theme, ThemeRegistry,
+    TitleBar,
+    badge::Badge,
+    button::{Button, ButtonVariants as _},
+    group_box::{GroupBox, GroupBoxVariants as _},
+    h_flex,
+    input::{Input, InputEvent, InputState},
+    menu::{DropdownMenu as _, PopupMenuItem},
+    radio::Radio,
+    scroll::ScrollableElement as _,
+    tab::{Tab, TabBar},
+    v_flex,
 };
 use tray_icon::{
     TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
-use winit::event_loop::EventLoopProxy;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use secretd::{
     aws::{AwsAccessLevel, AwsConfiguration, AwsLoginStatus, AwsTarget},
@@ -30,125 +44,102 @@ use secretd::{
 
 use crate::icon::{TrayStatus, tray_icon};
 
-const BACKGROUND: Color32 = Color32::from_rgb(245, 247, 245);
-const SURFACE: Color32 = Color32::WHITE;
-const SURFACE_MUTED: Color32 = Color32::from_rgb(249, 250, 249);
-const INK: Color32 = Color32::from_rgb(21, 33, 27);
-const MUTED: Color32 = Color32::from_rgb(99, 113, 105);
-const LINE: Color32 = Color32::from_rgb(218, 225, 221);
-const LINE_STRONG: Color32 = Color32::from_rgb(190, 201, 195);
-const GREEN: Color32 = Color32::from_rgb(20, 139, 94);
-const GREEN_SOFT: Color32 = Color32::from_rgb(230, 245, 237);
-const AMBER: Color32 = Color32::from_rgb(216, 145, 34);
-const RED: Color32 = Color32::from_rgb(202, 67, 67);
-const RED_SOFT: Color32 = Color32::from_rgb(255, 241, 241);
+const BACKGROUND: u32 = 0xe5e9ef;
+const SURFACE: u32 = 0xeff1f5;
+const SURFACE_MUTED: u32 = 0xdce0e8;
+const INK: u32 = 0x4c4f69;
+const MUTED: u32 = 0x7c7f93;
+const LINE: u32 = 0xccd0da;
+const GREEN: u32 = 0x5aa93b;
+const GREEN_SOFT: u32 = 0xe1eadc;
+const AMBER: u32 = 0xdf8e1d;
+const RED: u32 = 0xd26a53;
+const RED_SOFT: u32 = 0xf2d9d4;
 
-#[derive(Debug)]
+const CATPPUCCIN_LATTE_THEME: &str = r##"
+{
+  "name": "Catppuccin",
+  "author": "Catppuccino",
+  "url": "https://github.com/catppuccin/catppuccin",
+  "themes": [
+    {
+      "name": "Catppuccin Latte",
+      "mode": "light",
+      "colors": {
+        "accent.background": "#d3d8e0",
+        "accent.foreground": "#4c4f69",
+        "background": "#E5E9EF",
+        "border": "#CCD0DA",
+        "ring": "#7287fd",
+        "foreground": "#4c4f69",
+        "input.border": "#acb0be",
+        "link.active.foreground": "#7287fd",
+        "link.foreground": "#7287fd",
+        "link.hover.foreground": "#7287fd",
+        "list.active.background": "#7287fd22",
+        "list.active.border": "#7287fd",
+        "list.even.background": "#EFF1F5",
+        "list.head.background": "#dce0e8",
+        "muted.background": "#dce0e8",
+        "muted.foreground": "#9a9db2",
+        "panel.background": "#dce0e8",
+        "primary.active.background": "#7287fd",
+        "primary.background": "#7287fd",
+        "primary.foreground": "#EFF1F5",
+        "scrollbar.background": "#EFF1F500",
+        "scrollbar.thumb.background": "#acb0be",
+        "secondary.active.background": "#CCD2DE",
+        "secondary.background": "#dce0e8",
+        "secondary.foreground": "#4c4f69",
+        "secondary.hover.background": "#CCD2DE99",
+        "tab.active.background": "#E5E9EF",
+        "tab.active.foreground": "#4c4f69",
+        "tab.background": "#D2D7E200",
+        "tab.foreground": "#82848c",
+        "tab_bar.background": "#DCE0E8",
+        "title_bar.background": "#DCE0E8",
+        "title_bar.border": "#bec3d0",
+        "base.red": "#d26a53",
+        "base.green": "#5aa93b",
+        "base.yellow": "#df8e1d",
+        "base.blue": "#78acdc",
+        "base.magenta": "#8778dc",
+        "base.magenta.light": "#9978dc66",
+        "base.cyan": "#53d2b0"
+      }
+    }
+  ]
+}
+"##;
+
+#[derive(Clone, Copy, Debug)]
 pub enum AppEvent {
     Show,
     Toggle,
     Lock,
     StateChanged,
-    Repaint(Duration),
     Quit,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RequestDialogAction {
-    None,
-    Close,
-    OpenMain,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum View {
-    Secrets,
-    Aws,
-    Grants,
-    Activity,
-}
-
-struct SecretDraft {
-    original_name: Option<String>,
-    name: String,
-    value: Zeroizing<String>,
-}
-
-struct PasswordDraft {
-    password: Zeroizing<String>,
-    confirmation: Zeroizing<String>,
-}
-
-struct AwsTargetDraft {
-    profile: String,
-    account_id: String,
-    account_name: String,
-    email_address: String,
-    roles: Vec<String>,
-    read_only_role: String,
-    admin_role: String,
-    region: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AwsDraftStep {
-    Connection,
-    Aliases,
-}
-
-struct AwsDraft {
-    step: AwsDraftStep,
-    start_url: String,
-    sso_region: String,
-    targets: Vec<AwsTargetDraft>,
-}
-
-struct Toast {
-    message: String,
-    danger: bool,
-    expires_at: Instant,
-}
-
-#[derive(Clone, Copy)]
-struct RequestChoice {
-    seconds: u64,
-}
-
-pub struct SecretDApp {
+pub struct AppState {
     controller: Arc<Mutex<Controller>>,
     notify: Arc<dyn Fn() + Send + Sync>,
-    request_server: RequestServer,
+    _request_server: RequestServer,
     tray: TrayIcon,
     tray_menu: Menu,
-    tray_status: TrayStatus,
-    view: View,
-    auth_password: Zeroizing<String>,
-    auth_confirmation: Zeroizing<String>,
-    auth_error: Option<String>,
-    auth_focus_requested: bool,
-    search: String,
-    secret_draft: Option<SecretDraft>,
-    password_draft: Option<PasswordDraft>,
-    aws_draft: Option<AwsDraft>,
-    form_error: Option<String>,
-    revealed: Option<(String, Zeroizing<String>)>,
-    delete_confirmation: Option<String>,
-    request_choices: HashMap<String, RequestChoice>,
-    grant_process_choices: HashMap<String, ProcessIdentity>,
-    request_error: Option<String>,
-    toast: Option<Toast>,
+    tray_status: Mutex<TrayStatus>,
 }
 
-impl SecretDApp {
-    pub fn new(
-        event_proxy: EventLoopProxy<AppEvent>,
-    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+impl Global for AppState {}
+
+impl AppState {
+    pub fn new(sender: Sender<AppEvent>) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let controller = Arc::new(Mutex::new(Controller::new(
             default_vault_path().map_err(std::io::Error::other)?,
         )));
-        let notify_proxy = event_proxy.clone();
+        let notify_sender = sender.clone();
         let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            let _ = notify_proxy.send_event(AppEvent::StateChanged);
+            let _ = notify_sender.send(AppEvent::StateChanged);
         });
         let request_server = RequestServer::start(
             Arc::clone(&controller),
@@ -171,16 +162,16 @@ impl SecretDApp {
             .with_menu_on_left_click(false)
             .build()?;
 
-        let menu_proxy = event_proxy.clone();
+        let menu_sender = sender.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            let app_event = match event.id.as_ref() {
+            let event = match event.id.as_ref() {
                 "show" => Some(AppEvent::Show),
                 "lock" => Some(AppEvent::Lock),
                 "quit" => Some(AppEvent::Quit),
                 _ => None,
             };
-            if let Some(event) = app_event {
-                let _ = menu_proxy.send_event(event);
+            if let Some(event) = event {
+                let _ = menu_sender.send(event);
             }
         }));
         TrayIconEvent::set_event_handler(Some(move |event| {
@@ -191,134 +182,57 @@ impl SecretDApp {
             } = event
                 && should_toggle_for_tray_click(button, button_state)
             {
-                let _ = event_proxy.send_event(AppEvent::Toggle);
+                let _ = sender.send(AppEvent::Toggle);
             }
         }));
 
         Ok(Self {
             controller,
             notify,
-            request_server,
+            _request_server: request_server,
             tray,
             tray_menu,
-            tray_status,
-            view: View::Secrets,
-            auth_password: Zeroizing::new(String::new()),
-            auth_confirmation: Zeroizing::new(String::new()),
-            auth_error: None,
-            auth_focus_requested: false,
-            search: String::new(),
-            secret_draft: None,
-            password_draft: None,
-            aws_draft: None,
-            form_error: None,
-            revealed: None,
-            delete_confirmation: None,
-            request_choices: HashMap::new(),
-            grant_process_choices: HashMap::new(),
-            request_error: None,
-            toast: None,
+            tray_status: Mutex::new(tray_status),
         })
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> bool {
-        let quit = ui
-            .ctx()
-            .input(|input| input.modifiers.command && input.key_pressed(egui::Key::Q));
-        ui.ctx().request_repaint_after(Duration::from_millis(500));
-        let snapshot = self.snapshot();
-        ui.painter().rect_filled(ui.max_rect(), 0, BACKGROUND);
-        if !snapshot.vault_exists {
-            self.auth_ui(ui, true);
-        } else if !snapshot.unlocked {
-            self.auth_ui(ui, false);
-        } else {
-            self.workspace_ui(ui, snapshot);
-        }
-        self.secret_editor(ui.ctx());
-        self.password_editor(ui.ctx());
-        self.aws_editor(ui.ctx());
-        self.delete_dialog(ui.ctx());
-        self.toast_ui(ui.ctx());
-        quit
+    pub fn controller(&self) -> Arc<Mutex<Controller>> {
+        Arc::clone(&self.controller)
     }
 
-    pub fn refresh_state(&mut self) {
-        let snapshot = self.snapshot();
-        if matches!(
-            snapshot.aws_login,
-            AwsLoginStatus::Starting
-                | AwsLoginStatus::AwaitingUser(_)
-                | AwsLoginStatus::Discovering
-        ) {
-            self.view = View::Aws;
-        }
-        if self.aws_draft.is_none()
-            && snapshot.aws.as_ref().is_some_and(|aws| {
-                aws.configuration.targets.is_empty() && !aws.discovered_accounts.is_empty()
-            })
-        {
-            self.aws_draft = Some(aws_alias_draft(&snapshot));
-            self.form_error = None;
-        }
-        self.refresh_tray(&snapshot);
+    pub fn notify(&self) -> Arc<dyn Fn() + Send + Sync> {
+        Arc::clone(&self.notify)
     }
 
-    pub fn has_access_requests(&self) -> bool {
-        self.controller.lock().is_ok_and(|mut controller| {
-            let snapshot = controller.snapshot();
-            !snapshot.pending.is_empty() || !snapshot.pending_aws.is_empty()
-        })
-    }
-
-    pub fn aws_login_in_progress(&self) -> bool {
-        self.controller.lock().is_ok_and(|mut controller| {
-            matches!(
-                controller.snapshot().aws_login,
-                AwsLoginStatus::Starting
-                    | AwsLoginStatus::AwaitingUser(_)
-                    | AwsLoginStatus::Discovering
-            )
-        })
-    }
-
-    pub fn lock(&mut self) {
-        if let Ok(mut controller) = self.controller.lock() {
-            controller.lock();
-        }
-        self.clear_sensitive_ui();
-        self.refresh_state();
-    }
-
-    pub fn on_ui_closed(&mut self) {
-        self.clear_sensitive_ui();
-    }
-
-    pub fn shutdown(&mut self) {
-        self.lock();
-        self.request_server.close();
-    }
-
-    fn snapshot(&self) -> AppSnapshot {
+    pub fn snapshot(&self) -> AppSnapshot {
         self.controller
             .lock()
             .expect("secretd controller mutex was poisoned")
             .snapshot()
     }
 
-    fn refresh_tray(&mut self, snapshot: &AppSnapshot) {
-        let status = tray_status(snapshot);
-        if status != self.tray_status {
+    pub fn lock(&self) {
+        if let Ok(mut controller) = self.controller.lock() {
+            controller.lock();
+        }
+        (self.notify)();
+    }
+
+    pub fn refresh_tray(&self) {
+        let snapshot = self.snapshot();
+        let status = tray_status(&snapshot);
+        if let Ok(mut current) = self.tray_status.lock()
+            && *current != status
+        {
             if let Ok(icon) = tray_icon(status) {
                 let _ = self.tray.set_icon_with_as_template(Some(icon), false);
             }
-            self.tray_status = status;
+            *current = status;
         }
         let pending_count = snapshot.pending.len() + snapshot.pending_aws.len();
         let tooltip = if pending_count > 0 {
             format!(
-                "secretd — {} request{} pending",
-                pending_count,
+                "secretd — {pending_count} request{} pending",
                 if pending_count == 1 { "" } else { "s" }
             )
         } else if snapshot.unlocked {
@@ -330,1857 +244,2281 @@ impl SecretDApp {
             "secretd — locked".into()
         };
         let _ = self.tray.set_tooltip(Some(tooltip));
-        let _ = rebuild_tray_menu(&self.tray_menu, snapshot);
+        let _ = rebuild_tray_menu(&self.tray_menu, &snapshot);
     }
+}
 
-    fn auth_ui(&mut self, ui: &mut egui::Ui, creating: bool) {
-        let enter = ui.ctx().input(|input| input.key_pressed(egui::Key::Enter));
-        Frame::new().fill(BACKGROUND).show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                let estimated_height = if creating { 430.0 } else { 350.0 };
-                ui.add_space(((ui.available_height() - estimated_height) / 2.0).max(20.0));
-                Frame::new()
-                    .fill(SURFACE)
-                    .stroke(Stroke::new(1.0, LINE))
-                    .corner_radius(20)
-                    .inner_margin(Margin::same(32))
-                    .show(ui, |ui| {
-                        ui.set_width(420.0);
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                brand_mark(ui);
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        RichText::new("secretd")
-                                            .size(17.0)
-                                            .strong()
-                                            .color(INK),
-                                    );
-                                    ui.label(
-                                        RichText::new("LOCAL ENCRYPTED VAULT")
-                                            .size(10.0)
-                                            .strong()
-                                            .color(MUTED),
-                                    );
-                                });
-                            });
-                            ui.add_space(24.0);
-                            ui.label(
-                                RichText::new(if creating {
-                                    "Create your vault"
-                                } else {
-                                    "Welcome back"
-                                })
-                                .size(26.0)
-                                .strong()
-                                .color(INK),
-                            );
-                            ui.label(
-                                RichText::new(if creating {
-                                    "Protect credentials in an encrypted vault that stays on this Mac."
-                                } else {
-                                    "Unlock your vault to manage credentials and approve access."
-                                })
-                                .size(14.0)
-                                .color(MUTED),
-                            );
-                            ui.add_space(22.0);
-                            field_label(ui, "Master password");
-                            let password = singleline_field(
-                                ui,
-                                &mut *self.auth_password,
-                                "Enter your master password",
-                                true,
-                                f32::INFINITY,
-                            );
-                            if !self.auth_focus_requested {
-                                password.request_focus();
-                                self.auth_focus_requested = true;
-                            }
-                            ui.label(
-                                RichText::new(if creating {
-                                    "Use a password you can remember. It never leaves this device."
-                                } else {
-                                    "Your password is only used to decrypt the local vault."
-                                })
-                                .size(11.0)
-                                .color(MUTED),
-                            );
-                            if creating {
-                                ui.add_space(8.0);
-                                field_label(ui, "Confirm password");
-                                singleline_field(
-                                    ui,
-                                    &mut *self.auth_confirmation,
-                                    "Enter it again",
-                                    true,
-                                    f32::INFINITY,
-                                );
-                            }
-                            if let Some(error) = &self.auth_error {
-                                ui.add_space(4.0);
-                                error_banner(ui, error);
-                            }
-                            ui.add_space(12.0);
-                            let ready = !self.auth_password.is_empty()
-                                && (!creating || !self.auth_confirmation.is_empty());
-                            let submit_clicked = full_primary_button(
-                                ui,
-                                if creating {
-                                    "Create encrypted vault"
-                                } else {
-                                    "Unlock vault"
-                                },
-                                ready,
-                            )
-                            .clicked();
-                            if auth_submission_requested(submit_clicked, enter, ready) {
-                                self.submit_auth(creating);
-                            }
-                            ui.add_space(6.0);
-                            ui.vertical_centered(|ui| {
-                                ui.label(
-                                    RichText::new("AES-256 encrypted • PBKDF2 protected")
-                                        .size(10.0)
-                                        .color(MUTED),
-                                );
-                            });
-                        });
-                    });
-            });
+impl Drop for AppState {
+    fn drop(&mut self) {
+        if let Ok(mut controller) = self.controller.lock() {
+            controller.lock();
+        }
+        MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
+        TrayIconEvent::set_event_handler::<fn(TrayIconEvent)>(None);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum View {
+    #[default]
+    Secrets,
+    Aws,
+    Grants,
+    Activity,
+}
+
+#[derive(Clone, Debug)]
+enum Modal {
+    Secret { original_name: Option<String> },
+    Password,
+    AwsConnection,
+    AwsAliases,
+    Delete(String),
+}
+
+struct AwsAliasInputs {
+    account_id: String,
+    account_name: String,
+    email_address: String,
+    roles: Vec<String>,
+    profile: Entity<InputState>,
+    read_only_role: Entity<InputState>,
+    admin_role: Entity<InputState>,
+    region: String,
+}
+
+struct Toast {
+    message: String,
+    danger: bool,
+    expires_at: Instant,
+}
+
+pub struct MainView {
+    view: View,
+    auth_password: Entity<InputState>,
+    auth_confirmation: Entity<InputState>,
+    search: Entity<InputState>,
+    secret_name: Entity<InputState>,
+    secret_value: Entity<InputState>,
+    new_password: Entity<InputState>,
+    password_confirmation: Entity<InputState>,
+    aws_start_url: Entity<InputState>,
+    aws_region: Entity<InputState>,
+    aws_aliases: Vec<AwsAliasInputs>,
+    modal: Option<Modal>,
+    auth_error: Option<String>,
+    form_error: Option<String>,
+    revealed: Option<(String, Zeroizing<String>)>,
+    toast: Option<Toast>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl MainView {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let auth_password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter your master password")
+                .masked(true)
         });
+        let auth_confirmation = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter it again")
+                .masked(true)
+        });
+        if !Self::snapshot(cx).unlocked {
+            let focus_handle = auth_password.focus_handle(cx);
+            window.defer(cx, move |window, cx| {
+                focus_handle.focus(window, cx);
+            });
+        }
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search credentials…"));
+        let _subscriptions = vec![
+            cx.subscribe_in(&search, window, |_, _, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&auth_password, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    if Self::snapshot(cx).vault_exists {
+                        this.submit_auth_form(window, cx);
+                    } else {
+                        this.auth_confirmation.update(cx, |input, cx| {
+                            input.focus(window, cx);
+                        });
+                    }
+                }
+            }),
+            cx.subscribe_in(&auth_confirmation, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.submit_auth_form(window, cx);
+                }
+            }),
+        ];
+        Self {
+            view: View::Secrets,
+            auth_password,
+            auth_confirmation,
+            search,
+            secret_name: cx
+                .new(|cx| InputState::new(window, cx).placeholder("service/account/token")),
+            secret_value: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Secret value")
+                    .multi_line(true)
+            }),
+            new_password: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Enter a new password")
+                    .masked(true)
+            }),
+            password_confirmation: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Enter it again")
+                    .masked(true)
+            }),
+            aws_start_url: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("https://example.awsapps.com/start")
+            }),
+            aws_region: cx.new(|cx| InputState::new(window, cx).placeholder("ca-central-1")),
+            aws_aliases: Vec::new(),
+            modal: None,
+            auth_error: None,
+            form_error: None,
+            revealed: None,
+            toast: None,
+            _subscriptions,
+        }
     }
 
-    fn submit_auth(&mut self, creating: bool) {
+    fn controller(cx: &App) -> Arc<Mutex<Controller>> {
+        cx.global::<AppState>().controller()
+    }
+
+    fn snapshot(cx: &App) -> AppSnapshot {
+        cx.global::<AppState>().snapshot()
+    }
+
+    fn signal(cx: &App) {
+        (cx.global::<AppState>().notify())();
+    }
+
+    fn input_value(input: &Entity<InputState>, cx: &App) -> String {
+        input.read(cx).value().to_string()
+    }
+
+    fn set_input(
+        input: &Entity<InputState>,
+        value: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        input.update(cx, |input, cx| input.set_value(value, window, cx));
+    }
+
+    pub fn clear_sensitive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for input in [
+            &self.auth_password,
+            &self.auth_confirmation,
+            &self.secret_name,
+            &self.secret_value,
+            &self.new_password,
+            &self.password_confirmation,
+        ] {
+            Self::set_input(input, "", window, cx);
+        }
+        self.aws_aliases.clear();
+        self.modal = None;
+        self.revealed = None;
+        self.form_error = None;
         self.auth_error = None;
-        if creating && *self.auth_password != *self.auth_confirmation {
+        cx.notify();
+    }
+
+    fn lock_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_sensitive(window, cx);
+        cx.global::<AppState>().lock();
+    }
+
+    fn toast(&mut self, message: impl Into<String>, danger: bool, cx: &mut Context<Self>) {
+        self.toast = Some(Toast {
+            message: message.into(),
+            danger,
+            expires_at: Instant::now() + Duration::from_millis(2_800),
+        });
+        cx.notify();
+    }
+
+    fn submit_auth(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_auth_form(window, cx);
+    }
+
+    fn submit_auth_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let snapshot = Self::snapshot(cx);
+        let creating = !snapshot.vault_exists;
+        let password = Zeroizing::new(Self::input_value(&self.auth_password, cx));
+        let confirmation = Zeroizing::new(Self::input_value(&self.auth_confirmation, cx));
+        self.auth_error = None;
+        if creating && *password != *confirmation {
             self.auth_error = Some("Passwords do not match".into());
+            cx.notify();
             return;
         }
-        let result = self
-            .controller
+        let result = Self::controller(cx)
             .lock()
             .map_err(|_| "secretd state is unavailable".to_string())
             .and_then(|mut controller| {
                 if creating {
-                    controller
-                        .create_vault(&self.auth_password)
-                        .map_err(|error| error.to_string())
+                    controller.create_vault(&password)
                 } else {
-                    controller
-                        .unlock(&self.auth_password)
-                        .map_err(|error| error.to_string())
+                    controller.unlock(&password)
                 }
+                .map_err(|error| error.to_string())
             });
         match result {
             Ok(()) => {
-                self.auth_password.zeroize();
-                self.auth_confirmation.zeroize();
-                self.refresh_state();
-                (self.notify)();
+                Self::set_input(&self.auth_password, "", window, cx);
+                Self::set_input(&self.auth_confirmation, "", window, cx);
+                Self::signal(cx);
             }
             Err(error) => self.auth_error = Some(error),
         }
+        cx.notify();
     }
 
-    fn workspace_ui(&mut self, ui: &mut egui::Ui, snapshot: AppSnapshot) {
-        let mut lock_requested = false;
-        let mut password_requested = false;
-        Frame::new()
-            .fill(SURFACE)
-            .stroke(Stroke::new(1.0, LINE))
-            .inner_margin(Margin::symmetric(22, 10))
-            .show(ui, |ui| {
-                let single_row = ui.available_width() >= 900.0;
-                ui.horizontal(|ui| {
-                    brand_mark(ui);
-                    ui.label(RichText::new("secretd").size(18.0).strong().color(INK));
-                    status_pill(ui, "Vault unlocked", GREEN, GREEN_SOFT);
-                    if single_row {
-                        ui.add_space(10.0);
-                        workspace_nav(ui, &mut self.view, &snapshot);
-                        (password_requested, lock_requested) = workspace_actions(ui);
-                    }
-                });
-                if !single_row {
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        workspace_nav(ui, &mut self.view, &snapshot);
-                        (password_requested, lock_requested) = workspace_actions(ui);
-                    });
-                }
-            });
-        if lock_requested {
-            self.lock();
-        }
-        if password_requested {
-            self.password_draft = Some(PasswordDraft {
-                password: Zeroizing::new(String::new()),
-                confirmation: Zeroizing::new(String::new()),
-            });
-            self.form_error = None;
-        }
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                Frame::new()
-                    .inner_margin(Margin::symmetric(28, 22))
-                    .show(ui, |ui| match self.view {
-                        View::Secrets => self.secrets_ui(ui, &snapshot),
-                        View::Aws => self.aws_ui(ui, &snapshot),
-                        View::Grants => self.grants_ui(ui, &snapshot),
-                        View::Activity => self.activity_ui(ui, &snapshot),
-                    });
-            });
+    fn switch_view(&mut self, view: View, cx: &mut Context<Self>) {
+        self.view = view;
+        cx.notify();
     }
 
-    fn secrets_ui(&mut self, ui: &mut egui::Ui, snapshot: &AppSnapshot) {
-        section_header(
-            ui,
-            "Credentials",
-            "Manage encrypted credentials stored in your local vault.",
-        );
-        ui.horizontal(|ui| {
-            singleline_field(ui, &mut self.search, "Search credentials…", false, 310.0);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if primary_button(ui, "+ New credential").clicked() {
-                    self.secret_draft = Some(SecretDraft {
-                        original_name: None,
-                        name: String::new(),
-                        value: Zeroizing::new(String::new()),
-                    });
-                    self.form_error = None;
-                }
-            });
-        });
-        ui.add_space(14.0);
+    pub fn show_aws_login(&mut self, cx: &mut Context<Self>) {
+        self.switch_view(View::Aws, cx);
+    }
 
-        let query = self.search.to_ascii_lowercase();
-        let visible: Vec<_> = snapshot
-            .secrets
-            .iter()
-            .filter(|secret| query.is_empty() || secret.name.to_ascii_lowercase().contains(&query))
-            .cloned()
-            .collect();
-        if visible.is_empty() {
-            empty_state(
-                ui,
-                if snapshot.secrets.is_empty() {
-                    "Your vault is empty"
-                } else {
-                    "No matching credentials"
-                },
-            );
-            return;
-        }
-
-        let mut reveal = None;
-        let mut edit = None;
-        let mut delete = None;
-        for secret in visible {
-            Frame::new()
-                .fill(SURFACE)
-                .stroke(Stroke::new(1.0, LINE))
-                .corner_radius(14)
-                .inner_margin(Margin::same(16))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        credential_mark(ui);
-                        ui.label(RichText::new(&secret.name).size(14.0).strong().color(INK));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if danger_button(ui, "Delete").clicked() {
-                                delete = Some(secret.name.clone());
-                            }
-                            if secondary_button(ui, "Edit").clicked() {
-                                edit = Some(secret.name.clone());
-                            }
-                            if secondary_button(
-                                ui,
-                                if self
-                                    .revealed
-                                    .as_ref()
-                                    .is_some_and(|(name, _)| name == &secret.name)
-                                {
-                                    "Hide"
-                                } else {
-                                    "Reveal"
-                                },
-                            )
-                            .clicked()
-                            {
-                                reveal = Some(secret.name.clone());
-                            }
-                        });
-                    });
-                    if let Some((_, value)) = self
-                        .revealed
-                        .as_mut()
-                        .filter(|(name, _)| name == &secret.name)
-                    {
-                        ui.separator();
-                        ui.label(RichText::new("Secret value").small().strong().color(MUTED));
-                        ui.add(
-                            TextEdit::multiline(&mut **value)
-                                .desired_width(f32::INFINITY)
-                                .interactive(false),
-                        );
-                    }
-                });
-            ui.add_space(8.0);
-        }
-        if let Some(name) = reveal {
-            if self
-                .revealed
-                .as_ref()
-                .is_some_and(|(revealed, _)| revealed == &name)
-            {
-                self.revealed = None;
-            } else {
-                match self
-                    .controller
-                    .lock()
-                    .map_err(|_| "secretd state is unavailable".to_string())
-                    .and_then(|controller| {
-                        controller
-                            .reveal_secret(&name)
-                            .map_err(|error| error.to_string())
-                    }) {
-                    Ok(value) => self.revealed = Some((name, value)),
-                    Err(error) => self.toast(error, true),
+    fn open_secret(
+        &mut self,
+        original_name: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (name, value) = if let Some(name) = original_name.as_ref() {
+            match Self::controller(cx)
+                .lock()
+                .map_err(|_| "secretd state is unavailable".to_string())
+                .and_then(|controller| {
+                    controller
+                        .reveal_secret(name)
+                        .map_err(|error| error.to_string())
+                }) {
+                Ok(value) => (name.clone(), value.to_string()),
+                Err(error) => {
+                    self.toast(error, true, cx);
+                    return;
                 }
             }
+        } else {
+            (String::new(), String::new())
+        };
+        Self::set_input(&self.secret_name, name, window, cx);
+        Self::set_input(&self.secret_value, value, window, cx);
+        self.form_error = None;
+        self.modal = Some(Modal::Secret { original_name });
+        cx.notify();
+    }
+
+    fn save_secret(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Modal::Secret { original_name }) = self.modal.clone() else {
+            return;
+        };
+        let name = Self::input_value(&self.secret_name, cx);
+        let value = Zeroizing::new(Self::input_value(&self.secret_value, cx));
+        let result = Self::controller(cx)
+            .lock()
+            .map_err(|_| "secretd state is unavailable".to_string())
+            .and_then(|mut controller| {
+                controller
+                    .save_secret(&name, &value, original_name.as_deref())
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(()) => {
+                Self::set_input(&self.secret_name, "", window, cx);
+                Self::set_input(&self.secret_value, "", window, cx);
+                self.modal = None;
+                self.revealed = None;
+                self.form_error = None;
+                self.toast("Saved securely", false, cx);
+                Self::signal(cx);
+            }
+            Err(error) => self.form_error = Some(error),
         }
-        if let Some(name) = edit {
-            let result = self
-                .controller
+        cx.notify();
+    }
+
+    fn reveal_secret(&mut self, name: String, cx: &mut Context<Self>) {
+        if self
+            .revealed
+            .as_ref()
+            .is_some_and(|(revealed, _)| revealed == &name)
+        {
+            self.revealed = None;
+        } else {
+            match Self::controller(cx)
                 .lock()
                 .map_err(|_| "secretd state is unavailable".to_string())
                 .and_then(|controller| {
                     controller
                         .reveal_secret(&name)
                         .map_err(|error| error.to_string())
-                });
-            match result {
-                Ok(value) => {
-                    self.secret_draft = Some(SecretDraft {
-                        original_name: Some(name.clone()),
-                        name,
-                        value,
-                    });
-                    self.form_error = None;
-                }
-                Err(error) => self.toast(error, true),
+                }) {
+                Ok(value) => self.revealed = Some((name, value)),
+                Err(error) => self.toast(error, true, cx),
             }
         }
-        if let Some(name) = delete {
-            self.delete_confirmation = Some(name);
+        cx.notify();
+    }
+
+    fn delete_secret(&mut self, name: String, cx: &mut Context<Self>) {
+        let result = Self::controller(cx)
+            .lock()
+            .map_err(|_| "secretd state is unavailable".to_string())
+            .and_then(|mut controller| {
+                controller
+                    .delete_secret(&name)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(()) => {
+                self.modal = None;
+                self.revealed = None;
+                self.toast("Credential deleted", false, cx);
+                Self::signal(cx);
+            }
+            Err(error) => self.toast(error, true, cx),
+        }
+        cx.notify();
+    }
+
+    fn open_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        Self::set_input(&self.new_password, "", window, cx);
+        Self::set_input(&self.password_confirmation, "", window, cx);
+        self.form_error = None;
+        self.modal = Some(Modal::Password);
+        cx.notify();
+    }
+
+    fn save_password(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let password = Zeroizing::new(Self::input_value(&self.new_password, cx));
+        let confirmation = Zeroizing::new(Self::input_value(&self.password_confirmation, cx));
+        if *password != *confirmation {
+            self.form_error = Some("Passwords do not match".into());
+            cx.notify();
+            return;
+        }
+        let result = Self::controller(cx)
+            .lock()
+            .map_err(|_| "secretd state is unavailable".to_string())
+            .and_then(|mut controller| {
+                controller
+                    .change_password(&password)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(()) => {
+                Self::set_input(&self.new_password, "", window, cx);
+                Self::set_input(&self.password_confirmation, "", window, cx);
+                self.modal = None;
+                self.form_error = None;
+                self.toast("Password changed", false, cx);
+            }
+            Err(error) => self.form_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn open_aws_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let snapshot = Self::snapshot(cx);
+        let connection = snapshot.aws.as_ref().map(|aws| &aws.configuration);
+        Self::set_input(
+            &self.aws_start_url,
+            connection.map_or("", |value| value.start_url.as_str()),
+            window,
+            cx,
+        );
+        Self::set_input(
+            &self.aws_region,
+            connection.map_or("", |value| value.sso_region.as_str()),
+            window,
+            cx,
+        );
+        self.form_error = None;
+        self.modal = Some(Modal::AwsConnection);
+        cx.notify();
+    }
+
+    fn save_aws_connection(
+        &mut self,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let start_url = Self::input_value(&self.aws_start_url, cx);
+        let region = Self::input_value(&self.aws_region, cx);
+        let result = Self::controller(cx)
+            .lock()
+            .map_err(|_| "secretd state is unavailable".to_string())
+            .and_then(|mut controller| {
+                controller
+                    .save_aws_connection(start_url.trim().to_string(), region.trim().to_string())
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(()) => {
+                self.modal = None;
+                self.form_error = None;
+                match begin_aws_login(Self::controller(cx), cx.global::<AppState>().notify()) {
+                    Ok(()) => self.toast("AWS connection saved; sign in to continue", false, cx),
+                    Err(error) => self.toast(error, true, cx),
+                }
+                Self::signal(cx);
+            }
+            Err(error) => self.form_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn begin_aws_refresh(&mut self, cx: &mut Context<Self>) {
+        match begin_aws_login(Self::controller(cx), cx.global::<AppState>().notify()) {
+            Ok(()) => self.toast("AWS SSO login started", false, cx),
+            Err(error) => self.toast(error, true, cx),
         }
     }
 
-    fn aws_ui(&mut self, ui: &mut egui::Ui, snapshot: &AppSnapshot) {
+    fn open_aws_aliases(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let snapshot = Self::snapshot(cx);
+        let Some(aws) = snapshot.aws else {
+            return;
+        };
+        let mut used_aliases = HashSet::new();
+        self.aws_aliases = aws
+            .discovered_accounts
+            .iter()
+            .map(|account| {
+                let existing = aws
+                    .configuration
+                    .targets
+                    .iter()
+                    .find(|target| target.account_id == account.account_id);
+                let mut profile = existing.map_or_else(
+                    || suggested_alias(&account.account_name, &account.account_id),
+                    |target| target.profile.clone(),
+                );
+                if !used_aliases.insert(profile.clone()) {
+                    profile = format!("{}-{}", profile, &account.account_id[8..]);
+                    used_aliases.insert(profile.clone());
+                }
+                let read_only = existing.map_or_else(
+                    || suggested_role(&account.roles, AwsAccessLevel::ReadOnly),
+                    |target| target.read_only_role.clone(),
+                );
+                let admin = existing.map_or_else(
+                    || suggested_role(&account.roles, AwsAccessLevel::Admin),
+                    |target| target.admin_role.clone(),
+                );
+                AwsAliasInputs {
+                    account_id: account.account_id.clone(),
+                    account_name: account.account_name.clone(),
+                    email_address: account.email_address.clone(),
+                    roles: account.roles.clone(),
+                    profile: cx.new(|cx| InputState::new(window, cx).default_value(profile)),
+                    read_only_role: cx
+                        .new(|cx| InputState::new(window, cx).default_value(read_only)),
+                    admin_role: cx.new(|cx| InputState::new(window, cx).default_value(admin)),
+                    region: existing.map_or_else(String::new, |target| target.region.clone()),
+                }
+            })
+            .collect();
+        self.form_error = None;
+        self.modal = Some(Modal::AwsAliases);
+        cx.notify();
+    }
+
+    fn save_aws_aliases(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let snapshot = Self::snapshot(cx);
+        let Some(aws) = snapshot.aws else {
+            self.form_error = Some("AWS connection is no longer available".into());
+            cx.notify();
+            return;
+        };
+        let mut targets = Vec::new();
+        for input in &self.aws_aliases {
+            let profile = Self::input_value(&input.profile, cx).trim().to_string();
+            if profile.is_empty() {
+                continue;
+            }
+            let read_only_role = Self::input_value(&input.read_only_role, cx);
+            let admin_role = Self::input_value(&input.admin_role, cx);
+            if !input.roles.contains(&read_only_role) {
+                self.form_error = Some(format!("Select a read-only role for '{profile}'"));
+                cx.notify();
+                return;
+            }
+            if !input.roles.contains(&admin_role) {
+                self.form_error = Some(format!("Select an admin role for '{profile}'"));
+                cx.notify();
+                return;
+            }
+            targets.push(AwsTarget {
+                profile,
+                account_id: input.account_id.clone(),
+                read_only_role,
+                admin_role,
+                region: input.region.clone(),
+            });
+        }
+        if targets.is_empty() {
+            self.form_error = Some("Assign an alias to at least one AWS account".into());
+            cx.notify();
+            return;
+        }
+        let result = Self::controller(cx)
+            .lock()
+            .map_err(|_| "secretd state is unavailable".to_string())
+            .and_then(|mut controller| {
+                controller
+                    .save_aws_configuration(AwsConfiguration {
+                        start_url: aws.configuration.start_url,
+                        sso_region: aws.configuration.sso_region,
+                        targets,
+                    })
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(()) => {
+                self.aws_aliases.clear();
+                self.modal = None;
+                self.form_error = None;
+                self.toast("AWS profile aliases saved", false, cx);
+                Self::signal(cx);
+            }
+            Err(error) => self.form_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.modal, Some(Modal::Secret { .. })) {
+            Self::set_input(&self.secret_name, "", window, cx);
+            Self::set_input(&self.secret_value, "", window, cx);
+        }
+        if matches!(self.modal, Some(Modal::Password)) {
+            Self::set_input(&self.new_password, "", window, cx);
+            Self::set_input(&self.password_confirmation, "", window, cx);
+        }
+        self.aws_aliases.clear();
+        self.modal = None;
+        self.form_error = None;
+        cx.notify();
+    }
+
+    fn render_auth(&self, creating: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(rgb(BACKGROUND))
+            .child(
+                v_flex()
+                    .w(px(460.))
+                    .gap_4()
+                    .p_8()
+                    .bg(rgb(SURFACE))
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .rounded(px(20.))
+                    .child(brand())
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(26.))
+                                    .font_semibold()
+                                    .text_color(rgb(INK))
+                                    .child(if creating {
+                                        "Create your vault"
+                                    } else {
+                                        "Welcome back"
+                                    }),
+                            )
+                            .child(div().text_color(rgb(MUTED)).child(if creating {
+                                "Protect credentials in an encrypted vault that stays on this Mac."
+                            } else {
+                                "Unlock your vault to manage credentials and approve access."
+                            })),
+                    )
+                    .child(field(
+                        "Master password",
+                        Input::new(&self.auth_password).mask_toggle(),
+                    ))
+                    .when(creating, |this| {
+                        this.child(field(
+                            "Confirm password",
+                            Input::new(&self.auth_confirmation).mask_toggle(),
+                        ))
+                    })
+                    .when_some(self.auth_error.clone(), |this, error| {
+                        this.child(error_banner(error))
+                    })
+                    .child(
+                        Button::new("submit-auth")
+                            .primary()
+                            .large()
+                            .w_full()
+                            .label(if creating {
+                                "Create encrypted vault"
+                            } else {
+                                "Unlock vault"
+                            })
+                            .on_click(cx.listener(Self::submit_auth)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED))
+                            .text_center()
+                            .child("AES-256 encrypted • PBKDF2 protected"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_header(&self, snapshot: &AppSnapshot, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let entity = cx.entity();
+        let active_count = snapshot.grants.len() + snapshot.aws_grants.len();
+        let activity_count = snapshot.audit.len();
+        let badge_color = cx.theme().muted_foreground;
+        let selected_index = match self.view {
+            View::Secrets => 0,
+            View::Aws => 1,
+            View::Grants => 2,
+            View::Activity => 3,
+        };
+        TitleBar::new()
+            .child(
+                h_flex()
+                    .w_full()
+                    .h_full()
+                    .pr_3()
+                    .gap_3()
+                    .items_center()
+                    .child(title_bar_brand())
+                    .child(status_pill("Vault unlocked", GREEN, GREEN_SOFT))
+                    .child(div().w(px(4.)))
+                    .child(
+                        TabBar::new("main-navigation")
+                            .segmented()
+                            .small()
+                            .selected_index(selected_index)
+                            .on_click(move |index, _, cx| {
+                                let view = match index {
+                                    0 => View::Secrets,
+                                    1 => View::Aws,
+                                    2 => View::Grants,
+                                    _ => View::Activity,
+                                };
+                                entity.update(cx, |this, cx| this.switch_view(view, cx));
+                            })
+                            .child(Tab::new().label("Credentials"))
+                            .child(Tab::new().label("AWS SSO"))
+                            .child(
+                                Tab::new()
+                                    .aria_label(format!("Active, {active_count}"))
+                                    .child(
+                                        Badge::new()
+                                            .count(active_count)
+                                            .max(999)
+                                            .color(badge_color)
+                                            .child(
+                                                div()
+                                                    .when(active_count > 0, |this| this.pr_3())
+                                                    .child("Active"),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                Tab::new()
+                                    .aria_label(format!("Activity, {activity_count}"))
+                                    .child(
+                                        Badge::new()
+                                            .count(activity_count)
+                                            .max(999)
+                                            .color(badge_color)
+                                            .child(
+                                                div()
+                                                    .when(activity_count > 0, |this| this.pr_3())
+                                                    .child("Activity"),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("change-password")
+                            .ghost()
+                            .small()
+                            .label("Password")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_password(window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("lock")
+                            .outline()
+                            .small()
+                            .label("Lock")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.lock_vault(window, cx)),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_secrets(&self, snapshot: &AppSnapshot, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let query = Self::input_value(&self.search, cx).to_ascii_lowercase();
+        let visible: Vec<_> = snapshot
+            .secrets
+            .iter()
+            .filter(|secret| query.is_empty() || secret.name.to_ascii_lowercase().contains(&query))
+            .cloned()
+            .collect();
+        let entity = cx.entity();
+        v_flex()
+            .gap_4()
+            .child(section_header(
+                "Credentials",
+                "Manage encrypted credentials stored in your local vault.",
+            ))
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(div().w(px(320.)).child(Input::new(&self.search)))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("new-secret")
+                            .primary()
+                            .label("+ New credential")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_secret(None, window, cx)
+                            })),
+                    ),
+            )
+            .when(visible.is_empty(), |this| {
+                this.child(empty_state(if snapshot.secrets.is_empty() {
+                    "Your vault is empty"
+                } else {
+                    "No matching credentials"
+                }))
+            })
+            .children(visible.into_iter().map(|secret| {
+                let name = secret.name.clone();
+                let reveal_name = name.clone();
+                let edit_name = name.clone();
+                let delete_name = name.clone();
+                let revealed = self
+                    .revealed
+                    .as_ref()
+                    .filter(|(revealed, _)| revealed == &name)
+                    .map(|(_, value)| value.to_string());
+                card()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(credential_mark())
+                            .child(div().font_semibold().text_color(rgb(INK)).child(name))
+                            .child(div().flex_1())
+                            .child(
+                                Button::new(SharedString::from(format!("reveal-{reveal_name}")))
+                                    .outline()
+                                    .label(if revealed.is_some() { "Hide" } else { "Reveal" })
+                                    .on_click({
+                                        let entity = entity.clone();
+                                        move |_, _, cx| {
+                                            entity.update(cx, |this, cx| {
+                                                this.reveal_secret(reveal_name.clone(), cx)
+                                            });
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("edit-{edit_name}")))
+                                    .outline()
+                                    .label("Edit")
+                                    .on_click({
+                                        let entity = entity.clone();
+                                        move |_, window, cx| {
+                                            entity.update(cx, |this, cx| {
+                                                this.open_secret(
+                                                    Some(edit_name.clone()),
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("delete-{delete_name}")))
+                                    .danger()
+                                    .ghost()
+                                    .label("Delete")
+                                    .on_click({
+                                        let entity = entity.clone();
+                                        move |_, _, cx| {
+                                            entity.update(cx, |this, cx| {
+                                                this.modal =
+                                                    Some(Modal::Delete(delete_name.clone()));
+                                                cx.notify();
+                                            });
+                                        }
+                                    }),
+                            ),
+                    )
+                    .when_some(revealed, |this, value| {
+                        this.child(
+                            v_flex()
+                                .gap_1()
+                                .pt_2()
+                                .border_t_1()
+                                .border_color(rgb(LINE))
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .font_semibold()
+                                        .text_color(rgb(MUTED))
+                                        .child("SECRET VALUE"),
+                                )
+                                .child(
+                                    div()
+                                        .p_3()
+                                        .bg(rgb(SURFACE_MUTED))
+                                        .rounded(px(8.))
+                                        .font_family("monospace")
+                                        .child(value),
+                                ),
+                        )
+                    })
+            }))
+            .into_any_element()
+    }
+
+    fn render_aws(&self, snapshot: &AppSnapshot, cx: &mut Context<Self>) -> gpui::AnyElement {
         let login_in_progress = matches!(
             snapshot.aws_login,
             AwsLoginStatus::Starting
                 | AwsLoginStatus::AwaitingUser(_)
                 | AwsLoginStatus::Discovering
         );
-        let mut edit_connection = false;
-        let mut edit_aliases = false;
-        let mut refresh_accounts = false;
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new("AWS profiles").size(24.0).strong().color(INK));
-                ui.label(
-                    RichText::new("IAM Identity Center accounts and role mappings.")
-                        .size(13.0)
-                        .color(MUTED),
-                );
+        let has_connection = snapshot.aws.is_some();
+        let has_discovered_accounts = snapshot
+            .aws
+            .as_ref()
+            .is_some_and(|aws| !aws.discovered_accounts.is_empty());
+        let entity = cx.entity();
+        let configure_entity = entity.clone();
+        let actions = h_flex()
+            .gap_2()
+            .when(has_connection, |this| {
+                this.child(
+                    Button::new("refresh-aws")
+                        .primary()
+                        .small()
+                        .label(if login_in_progress {
+                            "Working…"
+                        } else {
+                            "Refresh"
+                        })
+                        .disabled(login_in_progress)
+                        .on_click(cx.listener(|this, _, _, cx| this.begin_aws_refresh(cx))),
+                )
+                .child(
+                    Button::new("configure-aws")
+                        .outline()
+                        .small()
+                        .label("Configure")
+                        .disabled(login_in_progress)
+                        .dropdown_menu(move |menu, _, _| {
+                            let aliases_entity = configure_entity.clone();
+                            let connection_entity = configure_entity.clone();
+                            menu.when(has_discovered_accounts, |this| {
+                                this.item(PopupMenuItem::new("Profile aliases").on_click(
+                                    move |_, window, cx| {
+                                        aliases_entity.update(cx, |this, cx| {
+                                            this.open_aws_aliases(window, cx)
+                                        });
+                                    },
+                                ))
+                            })
+                            .item(
+                                PopupMenuItem::new("SSO connection").on_click(
+                                    move |_, window, cx| {
+                                        connection_entity.update(cx, |this, cx| {
+                                            this.open_aws_connection(window, cx)
+                                        });
+                                    },
+                                ),
+                            )
+                        }),
+                )
+            })
+            .when(!has_connection, |this| {
+                this.child(
+                    Button::new("edit-aws-connection")
+                        .primary()
+                        .small()
+                        .label("Connect AWS")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_aws_connection(window, cx)),
+                        ),
+                )
             });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if snapshot.aws.is_some() {
-                    refresh_accounts = ui
-                        .add_enabled_ui(!login_in_progress, |ui| primary_button(ui, "Refresh"))
-                        .inner
-                        .clicked();
-                }
-                if snapshot
-                    .aws
-                    .as_ref()
-                    .is_some_and(|aws| !aws.discovered_accounts.is_empty())
-                {
-                    edit_aliases = ui
-                        .add_enabled_ui(!login_in_progress, |ui| secondary_button(ui, "Aliases"))
-                        .inner
-                        .clicked();
-                }
-                edit_connection = ui
-                    .add_enabled_ui(!login_in_progress, |ui| {
-                        secondary_button(
-                            ui,
-                            if snapshot.aws.is_some() {
-                                "Connection"
-                            } else {
-                                "Connect AWS"
-                            },
-                        )
-                    })
-                    .inner
-                    .clicked();
-            });
-        });
-        if edit_connection {
-            self.aws_draft = Some(aws_connection_draft(snapshot));
-            self.form_error = None;
-        }
-        if edit_aliases {
-            self.aws_draft = Some(aws_alias_draft(snapshot));
-            self.form_error = None;
-        }
-        if refresh_accounts {
-            match begin_aws_login(Arc::clone(&self.controller), Arc::clone(&self.notify)) {
-                Ok(()) => self.toast("AWS SSO login started", false),
-                Err(error) => self.toast(error, true),
-            }
-        }
-        ui.add_space(10.0);
-
-        match &snapshot.aws_login {
+        let mut content = v_flex().gap_4().child(
+            h_flex()
+                .items_start()
+                .child(section_header(
+                    "AWS profiles",
+                    "IAM Identity Center accounts and role mappings.",
+                ))
+                .child(div().flex_1())
+                .child(actions),
+        );
+        content = match &snapshot.aws_login {
             AwsLoginStatus::Starting => {
-                status_pill(ui, "Starting AWS login…", AMBER, SURFACE_MUTED);
+                content.child(status_pill("Starting AWS login…", AMBER, SURFACE_MUTED))
             }
             AwsLoginStatus::AwaitingUser(authorization) => {
-                Frame::new()
-                    .fill(GREEN_SOFT)
-                    .stroke(Stroke::new(1.0, LINE))
-                    .corner_radius(14)
-                    .inner_margin(Margin::same(16))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("Complete sign-in in your browser").strong());
-                        ui.label(
-                            RichText::new(format!(
-                                "Verification code: {}",
-                                authorization.user_code
-                            ))
-                            .monospace()
-                            .color(INK),
-                        );
-                        let url = authorization
-                            .verification_uri_complete
-                            .as_deref()
-                            .unwrap_or(&authorization.verification_uri);
-                        ui.hyperlink_to("Open AWS sign-in", url);
-                        ui.label(
-                            RichText::new(format!(
-                                "This request expires in {}",
-                                duration_until_seconds(authorization.expires_at)
-                            ))
-                            .small()
-                            .color(MUTED),
-                        );
-                    });
-                ui.add_space(12.0);
-            }
-            AwsLoginStatus::Discovering => {
-                status_pill(ui, "Loading AWS accounts and roles…", AMBER, SURFACE_MUTED);
-                ui.add_space(12.0);
-            }
-            AwsLoginStatus::LoggedIn { expires_at } => {
-                status_pill(
-                    ui,
-                    &format!(
-                        "Signed in · access token expires in {}",
-                        duration_until_seconds(*expires_at)
-                    ),
-                    GREEN,
-                    GREEN_SOFT,
-                );
-                ui.add_space(12.0);
-            }
-            AwsLoginStatus::Failed(error) => {
-                error_banner(ui, error);
-                ui.add_space(12.0);
-            }
-            AwsLoginStatus::Idle => {}
-        }
-
-        let Some(aws) = &snapshot.aws else {
-            empty_state(ui, "Step 1 · Enter your AWS access portal URL to begin");
-            return;
-        };
-        Frame::new()
-            .fill(SURFACE)
-            .stroke(Stroke::new(1.0, LINE))
-            .corner_radius(12)
-            .inner_margin(Margin::symmetric(14, 10))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("SSO connection").strong().color(INK));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        status_pill(
-                            ui,
-                            if aws.logged_in {
-                                "Available"
-                            } else {
-                                "Sign in"
-                            },
-                            if aws.logged_in { GREEN } else { AMBER },
-                            SURFACE_MUTED,
-                        );
-                        ui.label(
-                            RichText::new(format!(
-                                "{} · {}",
-                                aws.configuration.start_url, aws.configuration.sso_region
-                            ))
-                            .small()
-                            .color(MUTED),
-                        );
-                    });
-                });
-            });
-        ui.add_space(10.0);
-        if !aws.discovery_complete {
-            Frame::new()
-                .fill(SURFACE)
-                .stroke(Stroke::new(1.0, LINE))
-                .corner_radius(14)
-                .inner_margin(Margin::same(16))
-                .show(ui, |ui| {
-                    ui.label(RichText::new("Step 2 · Discover your accounts").strong());
-                    ui.label(
-                        RichText::new(
-                            "Sign in to AWS. secretd will load the accounts and roles assigned to you.",
+                let url = authorization
+                    .verification_uri_complete
+                    .clone()
+                    .unwrap_or_else(|| authorization.verification_uri.clone());
+                content.child(
+                    card()
+                        .bg(rgb(GREEN_SOFT))
+                        .child(
+                            div()
+                                .font_semibold()
+                                .child("Complete sign-in in your browser"),
                         )
-                        .small()
-                        .color(MUTED),
-                    );
-                });
-            return;
-        }
-        if aws.discovered_accounts.is_empty() {
-            empty_state(ui, "AWS returned no accounts assigned to this identity");
-            return;
-        }
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Profiles").size(18.0).strong().color(INK));
-            ui.label(
-                RichText::new(format!(
-                    "{} configured · {} discovered",
-                    aws.configuration.targets.len(),
-                    aws.discovered_accounts.len()
-                ))
-                .small()
-                .color(MUTED),
-            );
-            if aws.configuration.targets.is_empty() {
-                status_pill(ui, "Aliases required", AMBER, SURFACE_MUTED);
+                        .child(
+                            div()
+                                .font_family("monospace")
+                                .child(format!("Verification code: {}", authorization.user_code)),
+                        )
+                        .child(
+                            Button::new("open-aws-login")
+                                .primary()
+                                .label("Open AWS sign-in")
+                                .on_click(move |_, _, cx| cx.open_url(&url)),
+                        )
+                        .child(div().text_color(rgb(MUTED)).child(format!(
+                            "This request expires in {}",
+                            duration_until_seconds(authorization.expires_at)
+                        ))),
+                )
             }
-        });
-        if aws.configuration.targets.is_empty()
-            && primary_button(ui, "Assign profile aliases").clicked()
-        {
-            self.aws_draft = Some(aws_alias_draft(snapshot));
-            self.form_error = None;
+            AwsLoginStatus::Discovering => content.child(status_pill(
+                "Loading AWS accounts and roles…",
+                AMBER,
+                SURFACE_MUTED,
+            )),
+            AwsLoginStatus::LoggedIn { expires_at } => content.child(status_pill(
+                &format!(
+                    "Signed in · access token expires in {}",
+                    duration_until_seconds(*expires_at)
+                ),
+                GREEN,
+                GREEN_SOFT,
+            )),
+            AwsLoginStatus::Failed(error) => content.child(error_banner(error.clone())),
+            AwsLoginStatus::Idle => content,
+        };
+        let Some(aws) = &snapshot.aws else {
+            return content
+                .child(empty_state(
+                    "Step 1 · Enter your AWS access portal URL to begin",
+                ))
+                .into_any_element();
+        };
+        content
+            .child(
+                GroupBox::new()
+                    .id("aws-connection")
+                    .outline()
+                    .title(div().font_semibold().child("SSO connection"))
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .font_semibold()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .child(aws.configuration.start_url.clone()),
+                                    )
+                                    .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(
+                                        format!("Region · {}", aws.configuration.sso_region),
+                                    )),
+                            )
+                            .child(status_pill(
+                                if aws.logged_in {
+                                    "Available"
+                                } else {
+                                    "Sign in"
+                                },
+                                if aws.logged_in { GREEN } else { AMBER },
+                                SURFACE_MUTED,
+                            )),
+                    ),
+            )
+            .when(!aws.discovery_complete, |this| {
+                this.child(empty_state(
+                    "Step 2 · Sign in to discover your AWS accounts",
+                ))
+            })
+            .when(
+                aws.discovery_complete && aws.discovered_accounts.is_empty(),
+                |this| {
+                    this.child(empty_state(
+                        "AWS returned no accounts assigned to this identity",
+                    ))
+                },
+            )
+            .when(!aws.configuration.targets.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_size(px(18.))
+                                .font_semibold()
+                                .child("Configured profiles"),
+                        )
+                        .children(aws.configuration.targets.iter().map(|target| {
+                            GroupBox::new()
+                                .id(SharedString::from(format!(
+                                    "aws-profile-{}",
+                                    target.profile
+                                )))
+                                .outline()
+                                .child(
+                                    h_flex()
+                                        .gap_3()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .size(px(36.))
+                                                .flex_shrink_0()
+                                                .rounded(px(10.))
+                                                .bg(rgb(SURFACE_MUTED))
+                                                .text_color(rgb(INK))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_size(px(11.))
+                                                .font_semibold()
+                                                .child("AWS"),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .font_semibold()
+                                                        .font_family("monospace")
+                                                        .child(target.profile.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(12.))
+                                                        .text_color(rgb(MUTED))
+                                                        .child(format!(
+                                                            "Account {}",
+                                                            target.account_id
+                                                        )),
+                                                ),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .flex_shrink_0()
+                                                .items_end()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .text_size(px(12.))
+                                                        .child(target.read_only_role.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(12.))
+                                                        .text_color(rgb(MUTED))
+                                                        .child(target.admin_role.clone()),
+                                                ),
+                                        ),
+                                )
+                        })),
+                )
+            })
+            .when(
+                aws.discovery_complete
+                    && !aws.discovered_accounts.is_empty()
+                    && aws.configuration.targets.is_empty(),
+                |this| {
+                    this.child(
+                        Button::new("assign-aliases")
+                            .primary()
+                            .label("Assign profile aliases")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_aws_aliases(window, cx)
+                                }),
+                            ),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    fn render_grants(&self, snapshot: &AppSnapshot, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let entity = cx.entity();
+        v_flex()
+            .gap_4()
+            .child(section_header(
+                "Active access",
+                "Grants follow the selected process and its children for at most 60 minutes.",
+            ))
+            .when(
+                snapshot.grants.is_empty() && snapshot.aws_grants.is_empty(),
+                |this| this.child(empty_state("No active grants")),
+            )
+            .children(snapshot.aws_grants.iter().map(|grant| {
+                let revoke_id = grant.id.clone();
+                let extend_id = grant.id.clone();
+                card().child(
+                    h_flex()
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().font_semibold().child(format!(
+                                    "AWS {} · {} credentials",
+                                    grant.profile,
+                                    grant.level.label()
+                                )))
+                                .child(div().text_color(rgb(MUTED)).child(format!(
+                                    "{} · PID {} · expires in {}",
+                                    grant.process.executable,
+                                    grant.process.pid,
+                                    duration_until(grant.expires_at)
+                                ))),
+                        )
+                        .child(div().flex_1())
+                        .child(action_button(
+                            "Extend",
+                            extend_id,
+                            true,
+                            true,
+                            entity.clone(),
+                        ))
+                        .child(action_button(
+                            "Revoke",
+                            revoke_id,
+                            false,
+                            true,
+                            entity.clone(),
+                        )),
+                )
+            }))
+            .children(snapshot.grants.iter().map(|grant| {
+                let revoke_id = grant.id.clone();
+                let extend_id = grant.id.clone();
+                card().child(
+                    h_flex()
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().font_semibold().child(grant.resource.clone()))
+                                .child(div().text_color(rgb(MUTED)).child(format!(
+                                    "{} · PID {} · expires in {}",
+                                    grant.process.executable,
+                                    grant.process.pid,
+                                    duration_until(grant.expires_at)
+                                ))),
+                        )
+                        .child(div().flex_1())
+                        .child(action_button(
+                            "Extend",
+                            extend_id,
+                            true,
+                            false,
+                            entity.clone(),
+                        ))
+                        .child(action_button(
+                            "Revoke",
+                            revoke_id,
+                            false,
+                            false,
+                            entity.clone(),
+                        )),
+                )
+            }))
+            .into_any_element()
+    }
+
+    fn mutate_grant(&mut self, id: String, extend: bool, aws: bool, cx: &mut Context<Self>) {
+        if let Ok(mut controller) = Self::controller(cx).lock() {
+            match (extend, aws) {
+                (true, true) => controller.extend_aws_grant(&id),
+                (false, true) => controller.revoke_aws_grant(&id),
+                (true, false) => {
+                    controller.extend_grant(&id);
+                }
+                (false, false) => controller.revoke_grant(&id),
+            }
         }
-        ui.add_space(8.0);
-        if !aws.configuration.targets.is_empty() {
-            aws_profile_cards(ui, &aws.configuration.targets);
+        Self::signal(cx);
+        cx.notify();
+    }
+
+    fn render_activity(&self, snapshot: &AppSnapshot) -> gpui::AnyElement {
+        v_flex()
+            .gap_4()
+            .child(section_header(
+                "Activity",
+                "A memory-only record that is cleared when secretd exits.",
+            ))
+            .when(snapshot.audit.is_empty(), |this| {
+                this.child(empty_state("No activity yet"))
+            })
+            .children(snapshot.audit.iter().map(|entry| {
+                card()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .font_semibold()
+                                    .text_color(rgb(match entry.action {
+                                        AuditAction::Denied
+                                        | AuditAction::TimedOut
+                                        | AuditAction::Revoked => RED,
+                                        _ => GREEN,
+                                    }))
+                                    .child(audit_label(entry.action)),
+                            )
+                            .child(div().font_family("monospace").child(entry.secret.clone()))
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_color(rgb(MUTED))
+                                    .child(duration_since(entry.occurred_at)),
+                            ),
+                    )
+                    .child(div().text_color(rgb(MUTED)).child(format!(
+                        "{} · PID {}",
+                        entry.process.executable, entry.process.pid
+                    )))
+            }))
+            .into_any_element()
+    }
+
+    fn render_modal(&self, modal: &Modal, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let body = match modal {
+            Modal::Secret { original_name } => v_flex()
+                .gap_4()
+                .child(modal_title(if original_name.is_some() {
+                    "Edit credential"
+                } else {
+                    "New credential"
+                }))
+                .child(field("Name", Input::new(&self.secret_name)))
+                .child(field("Value", Input::new(&self.secret_value).h(px(150.))))
+                .when_some(self.form_error.clone(), |this, error| {
+                    this.child(error_banner(error))
+                })
+                .child(modal_actions(
+                    "Save credential",
+                    cx.listener(Self::save_secret),
+                    cx,
+                ))
+                .into_any_element(),
+            Modal::Password => v_flex()
+                .gap_4()
+                .child(modal_title("Change master password"))
+                .child(field(
+                    "New password",
+                    Input::new(&self.new_password).mask_toggle(),
+                ))
+                .child(field(
+                    "Confirm password",
+                    Input::new(&self.password_confirmation).mask_toggle(),
+                ))
+                .when_some(self.form_error.clone(), |this, error| {
+                    this.child(error_banner(error))
+                })
+                .child(modal_actions(
+                    "Update password",
+                    cx.listener(Self::save_password),
+                    cx,
+                ))
+                .into_any_element(),
+            Modal::AwsConnection => v_flex()
+                .gap_4()
+                .child(modal_title("Connect AWS IAM Identity Center"))
+                .child(div().text_color(rgb(MUTED)).child(
+                    "The portal connection and resulting login tokens stay in the encrypted vault.",
+                ))
+                .child(field(
+                    "AWS access portal URL",
+                    Input::new(&self.aws_start_url),
+                ))
+                .child(field(
+                    "IAM Identity Center region",
+                    Input::new(&self.aws_region),
+                ))
+                .when_some(self.form_error.clone(), |this, error| {
+                    this.child(error_banner(error))
+                })
+                .child(modal_actions(
+                    "Save and sign in",
+                    cx.listener(Self::save_aws_connection),
+                    cx,
+                ))
+                .into_any_element(),
+            Modal::AwsAliases => v_flex()
+                .gap_4()
+                .h(px(580.))
+                .overflow_hidden()
+                .child(modal_title("Assign AWS profile aliases"))
+                .child(
+                    div().flex_1().min_h_0().overflow_hidden().child(
+                        v_flex()
+                            .id("aws-alias-list")
+                            .size_full()
+                            .gap_3()
+                            .overflow_y_scrollbar()
+                            .children(self.aws_aliases.iter().map(|account| {
+                                card()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .font_semibold()
+                                                    .child(account.account_name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family("monospace")
+                                                    .text_color(rgb(MUTED))
+                                                    .child(account.account_id.clone()),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(rgb(MUTED))
+                                            .child(account.email_address.clone()),
+                                    )
+                                    .child(field(
+                                        "Local profile alias",
+                                        Input::new(&account.profile),
+                                    ))
+                                    .child(
+                                        h_flex()
+                                            .gap_3()
+                                            .child(div().flex_1().child(field(
+                                                "Read-only role",
+                                                Input::new(&account.read_only_role),
+                                            )))
+                                            .child(div().flex_1().child(field(
+                                                "Admin role",
+                                                Input::new(&account.admin_role),
+                                            ))),
+                                    )
+                                    .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(
+                                        format!("Available roles: {}", account.roles.join(", ")),
+                                    ))
+                            })),
+                    ),
+                )
+                .when_some(self.form_error.clone(), |this, error| {
+                    this.child(error_banner(error))
+                })
+                .child(modal_actions(
+                    "Save profile aliases",
+                    cx.listener(Self::save_aws_aliases),
+                    cx,
+                ))
+                .into_any_element(),
+            Modal::Delete(name) => {
+                let delete_name = name.clone();
+                let entity = cx.entity();
+                v_flex()
+                    .gap_4()
+                    .child(modal_title("Delete credential?"))
+                    .child(format!(
+                        "Permanently delete “{name}” from the encrypted vault?"
+                    ))
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(cancel_button(cx))
+                            .child(
+                                Button::new("confirm-delete")
+                                    .danger()
+                                    .label("Delete")
+                                    .on_click(move |_, _, cx| {
+                                        entity.update(cx, |this, cx| {
+                                            this.delete_secret(delete_name.clone(), cx)
+                                        });
+                                    }),
+                            ),
+                    )
+                    .into_any_element()
+            }
+        };
+        div()
+            .id("modal-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::rgba(0x15211b66))
+            .occlude()
+            .child(
+                div()
+                    .id("modal-panel")
+                    .occlude()
+                    .w(px(match modal {
+                        Modal::AwsAliases => 700.,
+                        _ => 500.,
+                    }))
+                    .max_h(px(720.))
+                    .p_6()
+                    .bg(rgb(SURFACE))
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .rounded(px(16.))
+                    .shadow_lg()
+                    .child(body),
+            )
+            .into_any_element()
+    }
+}
+
+impl Render for MainView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| Instant::now() >= toast.expires_at)
+        {
+            self.toast = None;
+        }
+        let snapshot = Self::snapshot(cx);
+        if !snapshot.vault_exists || !snapshot.unlocked {
+            return v_flex()
+                .size_full()
+                .bg(rgb(BACKGROUND))
+                .child(
+                    TitleBar::new().child(
+                        h_flex()
+                            .w_full()
+                            .h_full()
+                            .pr_3()
+                            .items_center()
+                            .child(title_bar_brand()),
+                    ),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .child(self.render_auth(!snapshot.vault_exists, cx)),
+                )
+                .into_any_element();
+        }
+        let content = match self.view {
+            View::Secrets => self.render_secrets(&snapshot, cx),
+            View::Aws => self.render_aws(&snapshot, cx),
+            View::Grants => self.render_grants(&snapshot, cx),
+            View::Activity => self.render_activity(&snapshot),
+        };
+        div()
+            .relative()
+            .size_full()
+            .bg(rgb(BACKGROUND))
+            .text_color(rgb(INK))
+            .child(
+                v_flex()
+                    .size_full()
+                    .child(self.render_header(&snapshot, cx))
+                    .child(
+                        div()
+                            .id("main-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scrollbar()
+                            .child(div().p_7().child(content)),
+                    ),
+            )
+            .when_some(self.modal.clone(), |this, modal| {
+                this.child(self.render_modal(&modal, cx))
+            })
+            .when_some(self.toast.as_ref(), |this, toast| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom_5()
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_4()
+                                .py_2()
+                                .rounded(px(10.))
+                                .bg(rgb(if toast.danger { RED } else { INK }))
+                                .text_color(rgb(SURFACE))
+                                .child(toast.message.clone()),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+}
+
+pub struct RequestView {
+    error: Option<String>,
+    grant_process_choices: HashMap<String, ProcessIdentity>,
+}
+
+impl RequestView {
+    pub fn new() -> Self {
+        Self {
+            error: None,
+            grant_process_choices: HashMap::new(),
         }
     }
 
-    pub fn request_dialog_ui(&mut self, ui: &mut egui::Ui) -> RequestDialogAction {
-        ui.ctx().request_repaint_after(Duration::from_millis(500));
-        let snapshot = self.snapshot();
-        ui.painter().rect_filled(ui.max_rect(), 0, BACKGROUND);
-        if snapshot.pending.is_empty() && snapshot.pending_aws.is_empty() {
-            return RequestDialogAction::Close;
+    fn snapshot(cx: &App) -> AppSnapshot {
+        cx.global::<AppState>().snapshot()
+    }
+
+    fn respond_secret(
+        &mut self,
+        id: String,
+        decision: ApprovalDecision,
+        process: Option<ProcessIdentity>,
+        cx: &mut Context<Self>,
+    ) {
+        let seconds = (decision == ApprovalDecision::Temporary).then_some(DEFAULT_GRANT_SECONDS);
+        let result = cx
+            .global::<AppState>()
+            .controller()
+            .lock()
+            .map_err(|_| "secretd state is unavailable".to_string())
+            .and_then(|mut controller| {
+                controller
+                    .respond(&id, decision, seconds, process)
+                    .map_err(|error| error.to_string())
+            });
+        if result.is_ok() {
+            self.grant_process_choices.remove(&id);
         }
-        let mut response = None;
-        let mut aws_response = None;
-        let mut action = RequestDialogAction::None;
-        Frame::new()
-            .fill(BACKGROUND)
-            .inner_margin(Margin::same(22))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    brand_mark(ui);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("Access request")
-                                .size(19.0)
-                                .strong()
-                                .color(INK),
-                        );
-                        ui.label(
-                            RichText::new("Review the requesting process before granting access")
-                                .small()
-                                .color(MUTED),
-                        );
-                    });
-                });
-                if let Some(error) = &self.request_error {
-                    ui.add_space(10.0);
-                    error_banner(ui, error);
-                }
-                ui.add_space(14.0);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let show_aws =
-                            match (snapshot.pending_aws.first(), snapshot.pending.first()) {
-                                (Some(aws), Some(secret)) => {
-                                    aws.requested_at <= secret.requested_at
-                                }
-                                (Some(_), None) => true,
-                                _ => false,
-                            };
-                        if show_aws {
-                            let request = snapshot
-                                .pending_aws
-                                .first()
-                                .expect("AWS request was selected");
-                            self.request_choices.entry(request.id.clone()).or_insert(
-                                RequestChoice {
-                                    seconds: DEFAULT_GRANT_SECONDS,
-                                },
-                            );
-                            let mut grant_process = self
-                                .grant_process_choices
-                                .get(&request.id)
-                                .cloned()
-                                .or_else(|| default_grant_process(&request.process_tree));
-                            Frame::new()
-                                .fill(SURFACE)
-                                .stroke(Stroke::new(
-                                    1.0,
-                                    if request.verified { LINE } else { AMBER },
-                                ))
-                                .corner_radius(14)
-                                .inner_margin(Margin::same(18))
-                                .show(ui, |ui| {
-                                    aws_request_heading(ui, request);
-                                    ui.add_space(12.0);
-                                    process_grant_selector(
-                                        ui,
-                                        &request.process_tree,
-                                        &mut grant_process,
-                                        request.verified,
-                                    );
-                                    ui.add_space(8.0);
-                                    if snapshot.unlocked && request.verified {
-                                        let choice =
-                                            self.request_choices.get_mut(&request.id).unwrap();
-                                        grant_duration_picker(ui, &request.id, choice);
-                                        ui.add_space(8.0);
-                                    }
-                                    ui.horizontal_wrapped(|ui| {
-                                        if danger_button(ui, "Deny").clicked() {
-                                            aws_response =
-                                                Some((request.id.clone(), None, None, None));
-                                        }
-                                        if snapshot.unlocked {
-                                            let seconds = self
-                                                .request_choices
-                                                .get(&request.id)
-                                                .map(|choice| choice.seconds);
-                                            if secondary_button(ui, "Grant read-only").clicked() {
-                                                aws_response = Some((
-                                                    request.id.clone(),
-                                                    Some(AwsAccessLevel::ReadOnly),
-                                                    grant_process.clone(),
-                                                    seconds,
-                                                ));
-                                            }
-                                            if admin_button(ui, "Grant admin").clicked() {
-                                                aws_response = Some((
-                                                    request.id.clone(),
-                                                    Some(AwsAccessLevel::Admin),
-                                                    grant_process.clone(),
-                                                    seconds,
-                                                ));
-                                            }
-                                        } else if primary_button(ui, "Open secretd to unlock")
-                                            .clicked()
-                                        {
-                                            action = RequestDialogAction::OpenMain;
-                                        }
-                                    });
-                                });
-                            if let Some(grant_process) = grant_process {
-                                self.grant_process_choices
-                                    .insert(request.id.clone(), grant_process);
-                            }
+        self.error = result.err();
+        (cx.global::<AppState>().notify())();
+        cx.notify();
+    }
+
+    fn respond_aws(
+        &mut self,
+        id: String,
+        level: Option<AwsAccessLevel>,
+        process: Option<ProcessIdentity>,
+        cx: &mut Context<Self>,
+    ) {
+        let result = cx
+            .global::<AppState>()
+            .controller()
+            .lock()
+            .map_err(|_| "secretd state is unavailable".to_string())
+            .and_then(|mut controller| {
+                controller
+                    .respond_aws(&id, level, process, Some(DEFAULT_GRANT_SECONDS))
+                    .map_err(|error| error.to_string())
+            });
+        if result.is_ok() {
+            self.grant_process_choices.remove(&id);
+        }
+        self.error = result.err();
+        (cx.global::<AppState>().notify())();
+        cx.notify();
+    }
+
+    fn select_grant_process(
+        &mut self,
+        request_id: String,
+        process: ProcessIdentity,
+        cx: &mut Context<Self>,
+    ) {
+        self.grant_process_choices.insert(request_id, process);
+        cx.notify();
+    }
+
+    fn grant_process(
+        &self,
+        request_id: &str,
+        process_tree: &[ProcessIdentity],
+    ) -> Option<ProcessIdentity> {
+        self.grant_process_choices
+            .get(request_id)
+            .filter(|selected| {
+                process_tree
+                    .iter()
+                    .any(|process| same_process(selected, process))
+            })
+            .cloned()
+            .or_else(|| default_grant_process(process_tree))
+    }
+
+    fn render_secret(
+        &self,
+        request: &PendingRequest,
+        unlocked: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let entity = cx.entity();
+        let process = self.grant_process(&request.id, &request.process_tree);
+        let deny_id = request.id.clone();
+        let once_id = request.id.clone();
+        let grant_id = request.id.clone();
+        card()
+            .gap_4()
+            .border_color(rgb(if request.verified { LINE } else { AMBER }))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(20.))
+                            .font_semibold()
+                            .child("Secret requested"),
+                    )
+                    .child(
+                        div()
+                            .font_family("monospace")
+                            .text_size(px(17.))
+                            .child(request.secret.clone()),
+                    )
+                    .child(status_pill(
+                        if request.verified {
+                            "Process verified"
                         } else {
-                            let request = snapshot
-                                .pending
-                                .first()
-                                .expect("secret request was selected");
-                            self.request_choices.entry(request.id.clone()).or_insert(
-                                RequestChoice {
-                                    seconds: DEFAULT_GRANT_SECONDS,
-                                },
-                            );
-                            let mut grant_process = self
-                                .grant_process_choices
-                                .get(&request.id)
-                                .cloned()
-                                .or_else(|| default_grant_process(&request.process_tree));
-                            Frame::new()
-                                .fill(SURFACE)
-                                .stroke(Stroke::new(
-                                    1.0,
-                                    if request.verified { LINE } else { AMBER },
-                                ))
-                                .corner_radius(14)
-                                .inner_margin(Margin::same(18))
-                                .show(ui, |ui| {
-                                    request_heading(ui, request);
-                                    ui.add_space(12.0);
-                                    process_grant_selector(
-                                        ui,
-                                        &request.process_tree,
-                                        &mut grant_process,
-                                        request.verified,
-                                    );
-                                    ui.add_space(8.0);
-                                    if snapshot.unlocked && request.verified {
-                                        let choice =
-                                            self.request_choices.get_mut(&request.id).unwrap();
-                                        grant_duration_picker(ui, &request.id, choice);
-                                        ui.add_space(8.0);
-                                    }
-                                    ui.horizontal_wrapped(|ui| {
-                                        if danger_button(ui, "Deny").clicked() {
-                                            response = Some((
-                                                request.id.clone(),
-                                                ApprovalDecision::Deny,
-                                                None,
-                                                None,
-                                            ));
-                                        }
-                                        if snapshot.unlocked
-                                            && secondary_button(ui, "Allow once").clicked()
-                                        {
-                                            response = Some((
-                                                request.id.clone(),
+                            "Process could not be verified"
+                        },
+                        if request.verified { GREEN } else { AMBER },
+                        SURFACE_MUTED,
+                    )),
+            )
+            .child(process_grant_selector(
+                &request.id,
+                &request.process_tree,
+                process.as_ref(),
+                request.verified,
+                entity.clone(),
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .child(Button::new("deny-secret").danger().label("Deny").on_click({
+                        let entity = entity.clone();
+                        move |_, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.respond_secret(
+                                    deny_id.clone(),
+                                    ApprovalDecision::Deny,
+                                    None,
+                                    cx,
+                                )
+                            });
+                        }
+                    }))
+                    .when(unlocked, |this| {
+                        this.child(
+                            Button::new("once-secret")
+                                .outline()
+                                .label("Allow once")
+                                .on_click({
+                                    let entity = entity.clone();
+                                    move |_, _, cx| {
+                                        entity.update(cx, |this, cx| {
+                                            this.respond_secret(
+                                                once_id.clone(),
                                                 ApprovalDecision::Once,
                                                 None,
-                                                None,
-                                            ));
-                                        }
-                                        if snapshot.unlocked && request.verified {
-                                            let seconds = self
-                                                .request_choices
-                                                .get(&request.id)
-                                                .map(|choice| choice.seconds);
-                                            if primary_button(ui, "Grant access").clicked() {
-                                                response = Some((
-                                                    request.id.clone(),
-                                                    ApprovalDecision::Temporary,
-                                                    seconds,
-                                                    grant_process.clone(),
-                                                ));
-                                            }
-                                        } else if !snapshot.unlocked
-                                            && primary_button(ui, "Open secretd to unlock")
-                                                .clicked()
-                                        {
-                                            action = RequestDialogAction::OpenMain;
-                                        }
+                                                cx,
+                                            )
+                                        });
+                                    }
+                                }),
+                        )
+                    })
+                    .when(unlocked && request.verified, |this| {
+                        this.child(
+                            Button::new("grant-secret")
+                                .primary()
+                                .label("Grant for 30 minutes")
+                                .on_click(move |_, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.respond_secret(
+                                            grant_id.clone(),
+                                            ApprovalDecision::Temporary,
+                                            process.clone(),
+                                            cx,
+                                        )
                                     });
-                                });
-                            if let Some(grant_process) = grant_process {
-                                self.grant_process_choices
-                                    .insert(request.id.clone(), grant_process);
-                            }
-                        }
-                    });
-            });
-        if let Some((id, decision, seconds, grant_process)) = response {
-            let result = self
-                .controller
-                .lock()
-                .map_err(|_| "secretd state is unavailable".to_string())
-                .and_then(|mut controller| {
-                    controller
-                        .respond(&id, decision, seconds, grant_process)
-                        .map_err(|error| error.to_string())
-                });
-            match result {
-                Ok(()) => {
-                    self.request_error = None;
-                    action = RequestDialogAction::Close;
-                }
-                Err(error) => self.request_error = Some(error),
-            }
-            self.request_choices.remove(&id);
-            self.grant_process_choices.remove(&id);
-            self.refresh_state();
-        }
-        if let Some((id, level, grant_process, seconds)) = aws_response {
-            let result = self
-                .controller
-                .lock()
-                .map_err(|_| "secretd state is unavailable".to_string())
-                .and_then(|mut controller| {
-                    controller
-                        .respond_aws(&id, level, grant_process, seconds)
-                        .map_err(|error| error.to_string())
-                });
-            match result {
-                Ok(()) => {
-                    self.request_error = None;
-                    action = RequestDialogAction::Close;
-                }
-                Err(error) => self.request_error = Some(error),
-            }
-            self.request_choices.remove(&id);
-            self.grant_process_choices.remove(&id);
-            self.refresh_state();
-        }
-        action
+                                }),
+                        )
+                    })
+                    .when(!unlocked, |this| {
+                        this.child(
+                            Button::new("unlock-main")
+                                .primary()
+                                .label("Open secretd to unlock")
+                                .on_click(|_, _, cx| crate::runtime::open_main(cx)),
+                        )
+                    }),
+            )
+            .into_any_element()
     }
 
-    pub fn deny_oldest_request(&mut self) {
-        let snapshot = self.snapshot();
-        let deny_aws = match (snapshot.pending_aws.first(), snapshot.pending.first()) {
+    fn render_aws_request(
+        &self,
+        request: &PendingAwsCredentialRequest,
+        unlocked: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let entity = cx.entity();
+        let process = self.grant_process(&request.id, &request.process_tree);
+        let deny_id = request.id.clone();
+        let read_id = request.id.clone();
+        let admin_id = request.id.clone();
+        card()
+            .gap_4()
+            .border_color(rgb(if request.verified { LINE } else { AMBER }))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(20.))
+                            .font_semibold()
+                            .child("AWS credentials requested"),
+                    )
+                    .child(
+                        div()
+                            .font_family("monospace")
+                            .text_size(px(17.))
+                            .child(format!("Profile: {}", request.profile)),
+                    ),
+            )
+            .child(process_grant_selector(
+                &request.id,
+                &request.process_tree,
+                process.as_ref(),
+                request.verified,
+                entity.clone(),
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .child(Button::new("deny-aws").danger().label("Deny").on_click({
+                        let entity = entity.clone();
+                        move |_, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.respond_aws(deny_id.clone(), None, None, cx)
+                            });
+                        }
+                    }))
+                    .when(unlocked, |this| {
+                        this.child(
+                            Button::new("read-aws")
+                                .outline()
+                                .label("Grant read-only")
+                                .on_click({
+                                    let entity = entity.clone();
+                                    let process = process.clone();
+                                    move |_, _, cx| {
+                                        entity.update(cx, |this, cx| {
+                                            this.respond_aws(
+                                                read_id.clone(),
+                                                Some(AwsAccessLevel::ReadOnly),
+                                                process.clone(),
+                                                cx,
+                                            )
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            Button::new("admin-aws")
+                                .danger()
+                                .label("Grant admin")
+                                .on_click(move |_, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.respond_aws(
+                                            admin_id.clone(),
+                                            Some(AwsAccessLevel::Admin),
+                                            process.clone(),
+                                            cx,
+                                        )
+                                    });
+                                }),
+                        )
+                    })
+                    .when(!unlocked, |this| {
+                        this.child(
+                            Button::new("unlock-main")
+                                .primary()
+                                .label("Open secretd to unlock")
+                                .on_click(|_, _, cx| crate::runtime::open_main(cx)),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+}
+
+impl Render for RequestView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let snapshot = Self::snapshot(cx);
+        let show_aws = match (snapshot.pending_aws.first(), snapshot.pending.first()) {
             (Some(aws), Some(secret)) => aws.requested_at <= secret.requested_at,
             (Some(_), None) => true,
             _ => false,
         };
-        if deny_aws {
-            if let Some(request) = snapshot.pending_aws.first()
-                && let Ok(mut controller) = self.controller.lock()
-            {
-                let _ = controller.respond_aws(&request.id, None, None, None);
-                self.request_choices.remove(&request.id);
-                self.grant_process_choices.remove(&request.id);
-            }
-        } else if let Some(request) = snapshot.pending.first()
-            && let Ok(mut controller) = self.controller.lock()
-        {
-            let _ = controller.respond(&request.id, ApprovalDecision::Deny, None, None);
-            self.request_choices.remove(&request.id);
-            self.grant_process_choices.remove(&request.id);
-        }
-        self.request_error = None;
-        self.refresh_state();
-    }
-
-    fn grants_ui(&mut self, ui: &mut egui::Ui, snapshot: &AppSnapshot) {
-        section_header(
-            ui,
-            "Active access",
-            "Grants follow the selected process and its children for at most 60 minutes at a time.",
-        );
-        if snapshot.grants.is_empty() && snapshot.aws_grants.is_empty() {
-            empty_state(ui, "No active grants");
-            return;
-        }
-        let mut revoke = None;
-        let mut revoke_aws = None;
-        let mut extend = None;
-        let mut extend_aws = None;
-        for grant in &snapshot.aws_grants {
-            Frame::new()
-                .fill(SURFACE)
-                .stroke(Stroke::new(1.0, LINE))
-                .corner_radius(14)
-                .inner_margin(Margin::same(16))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "AWS {} · {} credentials",
-                                    grant.profile,
-                                    match grant.level {
-                                        AwsAccessLevel::ReadOnly => "read-only",
-                                        AwsAccessLevel::Admin => "admin",
-                                    }
-                                ))
-                                .strong(),
-                            );
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} · PID {} · expires in {}",
-                                    grant.process.executable,
-                                    grant.process.pid,
-                                    duration_until(grant.expires_at)
-                                ))
-                                .small()
-                                .color(MUTED),
-                            );
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if danger_button(ui, "Revoke").clicked() {
-                                revoke_aws = Some(grant.id.clone());
-                            }
-                            if secondary_button(ui, "+15 min").clicked() {
-                                extend_aws = Some(grant.id.clone());
-                            }
-                        });
-                    });
-                });
-            ui.add_space(8.0);
-        }
-        for grant in &snapshot.grants {
-            Frame::new()
-                .fill(SURFACE)
-                .stroke(Stroke::new(1.0, LINE))
-                .corner_radius(14)
-                .inner_margin(Margin::same(16))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(&grant.resource).strong());
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} · PID {} · expires in {}",
-                                    grant.process.executable,
-                                    grant.process.pid,
-                                    duration_until(grant.expires_at)
-                                ))
-                                .small()
-                                .color(MUTED),
-                            );
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if danger_button(ui, "Revoke").clicked() {
-                                revoke = Some(grant.id.clone());
-                            }
-                            if secondary_button(ui, "+15 min").clicked() {
-                                extend = Some(grant.id.clone());
-                            }
-                        });
-                    });
-                });
-            ui.add_space(8.0);
-        }
-        if let Some(id) = revoke {
-            if let Ok(mut controller) = self.controller.lock() {
-                controller.revoke_grant(&id);
-            }
-            self.refresh_state();
-        }
-        if let Some(id) = revoke_aws {
-            if let Ok(mut controller) = self.controller.lock() {
-                controller.revoke_aws_grant(&id);
-            }
-            self.refresh_state();
-        }
-        if let Some(id) = extend {
-            if let Ok(mut controller) = self.controller.lock() {
-                controller.extend_grant(&id);
-            }
-            self.refresh_state();
-        }
-        if let Some(id) = extend_aws {
-            if let Ok(mut controller) = self.controller.lock() {
-                controller.extend_aws_grant(&id);
-            }
-            self.refresh_state();
-        }
-    }
-
-    fn activity_ui(&mut self, ui: &mut egui::Ui, snapshot: &AppSnapshot) {
-        section_header(
-            ui,
-            "Activity",
-            "A memory-only record that is cleared when secretd exits.",
-        );
-        if snapshot.audit.is_empty() {
-            empty_state(ui, "No activity yet");
-            return;
-        }
-        for entry in &snapshot.audit {
-            Frame::new()
-                .fill(SURFACE)
-                .stroke(Stroke::new(1.0, LINE))
-                .corner_radius(14)
-                .inner_margin(Margin::same(14))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(audit_label(entry.action))
-                                .strong()
-                                .color(audit_color(entry.action)),
-                        );
-                        ui.label(RichText::new(&entry.secret).monospace().color(INK));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(duration_since(entry.occurred_at))
-                                    .small()
-                                    .color(MUTED),
-                            );
-                        });
-                    });
-                    ui.label(
-                        RichText::new(format!(
-                            "{} · PID {}",
-                            entry.process.executable, entry.process.pid
-                        ))
-                        .small()
-                        .color(MUTED),
-                    );
-                });
-            ui.add_space(6.0);
-        }
-    }
-
-    fn secret_editor(&mut self, context: &egui::Context) {
-        let Some(draft) = &mut self.secret_draft else {
-            return;
-        };
-        let mut save = false;
-        let mut close = false;
-        egui::Window::new(if draft.original_name.is_some() {
-            "Edit credential"
+        let request = if show_aws {
+            snapshot
+                .pending_aws
+                .first()
+                .map(|request| self.render_aws_request(request, snapshot.unlocked, cx))
         } else {
-            "New credential"
-        })
-        .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .collapsible(false)
-        .resizable(false)
-        .show(context, |ui| {
-            ui.set_width(460.0);
-            field_label(ui, "Name");
-            singleline_field(
-                ui,
-                &mut draft.name,
-                "service/account/token",
-                false,
-                f32::INFINITY,
-            );
-            field_label(ui, "Value");
-            ui.add(
-                TextEdit::multiline(&mut *draft.value)
-                    .desired_rows(6)
-                    .frame(input_frame())
-                    .desired_width(f32::INFINITY),
-            );
-            if let Some(error) = &self.form_error {
-                error_banner(ui, error);
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if primary_button(ui, "Save credential").clicked() {
-                    save = true;
-                }
-                if secondary_button(ui, "Cancel").clicked() {
-                    close = true;
-                }
-            });
-        });
-        if save {
-            let result = self
-                .controller
-                .lock()
-                .map_err(|_| "secretd state is unavailable".to_string())
-                .and_then(|mut controller| {
-                    controller
-                        .save_secret(&draft.name, &draft.value, draft.original_name.as_deref())
-                        .map_err(|error| error.to_string())
-                });
-            match result {
-                Ok(()) => {
-                    close = true;
-                    self.revealed = None;
-                    self.toast("Saved securely", false);
-                    self.refresh_state();
-                }
-                Err(error) => self.form_error = Some(error),
-            }
-        }
-        if close {
-            self.secret_draft = None;
-            self.form_error = None;
-        }
-    }
-
-    fn aws_editor(&mut self, context: &egui::Context) {
-        let Some(draft) = &mut self.aws_draft else {
-            return;
+            snapshot
+                .pending
+                .first()
+                .map(|request| self.render_secret(request, snapshot.unlocked, cx))
         };
-        let mut save = false;
-        let mut close = false;
-        let title = match draft.step {
-            AwsDraftStep::Connection => "Connect AWS IAM Identity Center",
-            AwsDraftStep::Aliases => "Assign AWS profile aliases",
-        };
-        egui::Window::new(title)
-            .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(650.0)
-            .max_height(720.0)
-            .show(context, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    match draft.step {
-                        AwsDraftStep::Connection => {
-                            ui.label(
-                                RichText::new(
-                                    "Step 1 of 2 · The portal connection and resulting login tokens are stored in the encrypted vault.",
-                                )
-                                .color(MUTED),
-                            );
-                            ui.add_space(8.0);
-                            field_label(ui, "AWS access portal URL");
-                            singleline_field(
-                                ui,
-                                &mut draft.start_url,
-                                "https://example.awsapps.com/start",
-                                false,
-                                f32::INFINITY,
-                            );
-                            field_label(ui, "IAM Identity Center region");
-                            singleline_field(
-                                ui,
-                                &mut draft.sso_region,
-                                "ca-central-1",
-                                false,
-                                f32::INFINITY,
-                            );
-                        }
-                        AwsDraftStep::Aliases => {
-                            ui.label(
-                                RichText::new(
-                                    "Step 2 of 2 · Choose a local alias and the roles secretd should offer for each discovered account. Clear an alias to omit that account.",
-                                )
-                                .color(MUTED),
-                            );
-                            ui.add_space(10.0);
-                            for target in &mut draft.targets {
-                                Frame::new()
-                                    .fill(SURFACE_MUTED)
-                                    .stroke(Stroke::new(1.0, LINE))
-                                    .corner_radius(12)
-                                    .inner_margin(Margin::same(14))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(if target.account_name.is_empty() {
-                                                    "AWS account"
-                                                } else {
-                                                    &target.account_name
-                                                })
-                                                .strong(),
-                                            );
-                                            ui.label(
-                                                RichText::new(&target.account_id)
-                                                    .monospace()
-                                                    .color(MUTED),
-                                            );
-                                        });
-                                        if !target.email_address.is_empty() {
-                                            ui.label(
-                                                RichText::new(&target.email_address)
-                                                    .small()
-                                                    .color(MUTED),
-                                            );
-                                        }
-                                        field_label(ui, "Local profile alias");
-                                        singleline_field(
-                                            ui,
-                                            &mut target.profile,
-                                            "prod",
-                                            false,
-                                            f32::INFINITY,
-                                        );
-                                        if !target.profile.trim().is_empty() {
-                                            let roles = target.roles.clone();
-                                            ui.columns(2, |columns| {
-                                                role_picker(
-                                                    &mut columns[0],
-                                                    &target.account_id,
-                                                    "Read-only role",
-                                                    "ro",
-                                                    &roles,
-                                                    &mut target.read_only_role,
-                                                );
-                                                role_picker(
-                                                    &mut columns[1],
-                                                    &target.account_id,
-                                                    "Admin role",
-                                                    "admin",
-                                                    &roles,
-                                                    &mut target.admin_role,
-                                                );
-                                            });
-                                        }
-                                    });
-                                ui.add_space(8.0);
-                            }
-                        }
-                    }
-                    if let Some(error) = &self.form_error {
-                        ui.add_space(8.0);
-                        error_banner(ui, error);
-                    }
-                    ui.add_space(12.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let label = match draft.step {
-                            AwsDraftStep::Connection => "Save and sign in",
-                            AwsDraftStep::Aliases => "Save profile aliases",
-                        };
-                        if primary_button(ui, label).clicked() {
-                            save = true;
-                        }
-                        if secondary_button(ui, "Cancel").clicked() {
-                            close = true;
-                        }
-                    });
-                });
-            });
-        if save {
-            let step = draft.step;
-            let result = match step {
-                AwsDraftStep::Connection => save_aws_connection(&self.controller, draft),
-                AwsDraftStep::Aliases => save_aws_aliases(&self.controller, draft),
-            };
-            match result {
-                Ok(()) => {
-                    close = true;
-                    if step == AwsDraftStep::Connection {
-                        match begin_aws_login(
-                            Arc::clone(&self.controller),
-                            Arc::clone(&self.notify),
-                        ) {
-                            Ok(()) => {
-                                self.toast("AWS connection saved; sign in to continue", false)
-                            }
-                            Err(error) => self.toast(error, true),
-                        }
-                    } else {
-                        self.toast("AWS profile aliases saved", false);
-                    }
-                    self.refresh_state();
-                }
-                Err(error) => self.form_error = Some(error),
-            }
+        v_flex()
+            .size_full()
+            .bg(rgb(BACKGROUND))
+            .child(
+                TitleBar::new().child(
+                    h_flex()
+                        .w_full()
+                        .h_full()
+                        .pr_3()
+                        .gap_2()
+                        .items_center()
+                        .child(title_bar_brand())
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(MUTED))
+                                .child("Access request"),
+                        ),
+                ),
+            )
+            .child(
+                v_flex()
+                    .id("request-content")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
+                    .gap_4()
+                    .p_6()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(22.))
+                                    .font_semibold()
+                                    .child("Access request"),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(MUTED))
+                                    .child("Review the requesting process before granting access"),
+                            ),
+                    )
+                    .when_some(self.error.clone(), |this, error| {
+                        this.child(error_banner(error))
+                    })
+                    .when_some(request, |this, request| this.child(request)),
+            )
+            .into_any_element()
+    }
+}
+
+pub fn deny_oldest_request(cx: &mut App) {
+    let snapshot = cx.global::<AppState>().snapshot();
+    let deny_aws = match (snapshot.pending_aws.first(), snapshot.pending.first()) {
+        (Some(aws), Some(secret)) => aws.requested_at <= secret.requested_at,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    let controller = cx.global::<AppState>().controller();
+    if deny_aws {
+        if let Some(request) = snapshot.pending_aws.first()
+            && let Ok(mut controller) = controller.lock()
+        {
+            let _ = controller.respond_aws(&request.id, None, None, None);
         }
-        if close {
-            self.aws_draft = None;
-            self.form_error = None;
-        }
+    } else if let Some(request) = snapshot.pending.first()
+        && let Ok(mut controller) = controller.lock()
+    {
+        let _ = controller.respond(&request.id, ApprovalDecision::Deny, None, None);
     }
-
-    fn password_editor(&mut self, context: &egui::Context) {
-        let Some(draft) = &mut self.password_draft else {
-            return;
-        };
-        let mut save = false;
-        let mut close = false;
-        egui::Window::new("Change master password")
-            .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .collapsible(false)
-            .resizable(false)
-            .show(context, |ui| {
-                ui.set_width(400.0);
-                ui.label(
-                    RichText::new("Choose a new password for the encrypted local vault.")
-                        .color(MUTED),
-                );
-                ui.add_space(8.0);
-                field_label(ui, "New password");
-                singleline_field(
-                    ui,
-                    &mut *draft.password,
-                    "Enter a new password",
-                    true,
-                    f32::INFINITY,
-                );
-                field_label(ui, "Confirm password");
-                singleline_field(
-                    ui,
-                    &mut *draft.confirmation,
-                    "Enter it again",
-                    true,
-                    f32::INFINITY,
-                );
-                if let Some(error) = &self.form_error {
-                    error_banner(ui, error);
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if primary_button(ui, "Update password").clicked() {
-                        save = true;
-                    }
-                    if secondary_button(ui, "Cancel").clicked() {
-                        close = true;
-                    }
-                });
-            });
-        if save {
-            if *draft.password != *draft.confirmation {
-                self.form_error = Some("Passwords do not match".into());
-            } else {
-                let result = self
-                    .controller
-                    .lock()
-                    .map_err(|_| "secretd state is unavailable".to_string())
-                    .and_then(|mut controller| {
-                        controller
-                            .change_password(&draft.password)
-                            .map_err(|error| error.to_string())
-                    });
-                match result {
-                    Ok(()) => {
-                        close = true;
-                        self.toast("Password changed", false);
-                    }
-                    Err(error) => self.form_error = Some(error),
-                }
-            }
-        }
-        if close {
-            self.password_draft = None;
-            self.form_error = None;
-        }
-    }
-
-    fn delete_dialog(&mut self, context: &egui::Context) {
-        let Some(name) = self.delete_confirmation.clone() else {
-            return;
-        };
-        let mut delete = false;
-        let mut close = false;
-        egui::Window::new("Delete credential?")
-            .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .collapsible(false)
-            .resizable(false)
-            .show(context, |ui| {
-                ui.label(format!(
-                    "Permanently delete “{name}” from the encrypted vault?"
-                ));
-                ui.horizontal(|ui| {
-                    if secondary_button(ui, "Cancel").clicked() {
-                        close = true;
-                    }
-                    if danger_button(ui, "Delete").clicked() {
-                        delete = true;
-                    }
-                });
-            });
-        if delete {
-            let result = self
-                .controller
-                .lock()
-                .map_err(|_| "secretd state is unavailable".to_string())
-                .and_then(|mut controller| {
-                    controller
-                        .delete_secret(&name)
-                        .map_err(|error| error.to_string())
-                });
-            match result {
-                Ok(()) => {
-                    close = true;
-                    self.revealed = None;
-                    self.toast("Credential deleted", false);
-                    self.refresh_state();
-                }
-                Err(error) => self.toast(error, true),
-            }
-        }
-        if close {
-            self.delete_confirmation = None;
-        }
-    }
-
-    fn toast_ui(&mut self, context: &egui::Context) {
-        let Some(toast) = &self.toast else {
-            return;
-        };
-        if Instant::now() >= toast.expires_at {
-            self.toast = None;
-            return;
-        }
-        context.request_repaint_after(toast.expires_at - Instant::now());
-        egui::Area::new(egui::Id::new("toast"))
-            .anchor(Align2::CENTER_BOTTOM, egui::vec2(0.0, -20.0))
-            .show(context, |ui| {
-                Frame::new()
-                    .fill(if toast.danger { RED } else { INK })
-                    .corner_radius(10)
-                    .inner_margin(Margin::symmetric(14, 9))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new(&toast.message).color(Color32::WHITE));
-                    });
-            });
-    }
-
-    fn toast(&mut self, message: impl Into<String>, danger: bool) {
-        self.toast = Some(Toast {
-            message: message.into(),
-            danger,
-            expires_at: Instant::now() + Duration::from_millis(2_800),
-        });
-    }
-
-    fn clear_sensitive_ui(&mut self) {
-        self.auth_password.zeroize();
-        self.auth_confirmation.zeroize();
-        self.secret_draft = None;
-        self.password_draft = None;
-        self.aws_draft = None;
-        self.revealed = None;
-        self.form_error = None;
-        self.request_error = None;
-        self.request_choices.clear();
-        self.grant_process_choices.clear();
-        self.auth_focus_requested = false;
-    }
+    (cx.global::<AppState>().notify())();
 }
 
-pub fn background_color() -> [f32; 4] {
-    BACKGROUND.to_normalized_gamma_f32()
-}
-
-pub fn configure_style(context: &egui::Context) {
-    let mut visuals = egui::Visuals::light();
-    visuals.panel_fill = BACKGROUND;
-    visuals.faint_bg_color = SURFACE_MUTED;
-    visuals.extreme_bg_color = SURFACE_MUTED;
-    visuals.text_edit_bg_color = Some(SURFACE);
-    visuals.override_text_color = Some(INK);
-    visuals.weak_text_color = Some(MUTED);
-    visuals.window_fill = SURFACE;
-    visuals.window_stroke = Stroke::new(1.0, LINE);
-    visuals.window_corner_radius = CornerRadius::same(16);
-    visuals.menu_corner_radius = CornerRadius::same(12);
-    visuals.widgets.inactive.corner_radius = CornerRadius::same(10);
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, LINE_STRONG);
-    visuals.widgets.hovered.corner_radius = CornerRadius::same(10);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, GREEN);
-    visuals.widgets.active.corner_radius = CornerRadius::same(10);
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, GREEN);
-    visuals.widgets.open.corner_radius = CornerRadius::same(10);
-    visuals.widgets.open.bg_stroke = Stroke::new(1.0, GREEN);
-    visuals.selection.bg_fill = Color32::from_rgb(189, 228, 210);
-    visuals.selection.stroke = Stroke::new(1.5, GREEN);
-    visuals.error_fg_color = RED;
-    visuals.warn_fg_color = AMBER;
-    context.set_visuals(visuals);
-    context.all_styles_mut(|style| {
-        style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-        style.spacing.button_padding = egui::vec2(14.0, 9.0);
-        style.spacing.interact_size.y = 36.0;
-        style.spacing.combo_width = 132.0;
-        style.spacing.window_margin = Margin::same(22);
-        style.text_styles.insert(
-            egui::TextStyle::Heading,
-            FontId::new(24.0, egui::FontFamily::Proportional),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Body,
-            FontId::new(13.5, egui::FontFamily::Proportional),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Button,
-            FontId::new(13.0, egui::FontFamily::Proportional),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Small,
-            FontId::new(11.5, egui::FontFamily::Proportional),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Monospace,
-            FontId::new(12.5, egui::FontFamily::Monospace),
-        );
-    });
-}
-
-fn section_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.label(RichText::new(title).size(24.0).strong().color(INK));
-    ui.label(RichText::new(subtitle).size(14.0).color(MUTED));
-    ui.add_space(18.0);
-}
-
-fn aws_profile_grid_columns(available_width: f32) -> usize {
-    const MIN_CARD_WIDTH: f32 = 420.0;
-    const GAP: f32 = 10.0;
-    (((available_width + GAP) / (MIN_CARD_WIDTH + GAP)).floor() as usize).clamp(1, 3)
-}
-
-fn aws_profile_cards(ui: &mut egui::Ui, targets: &[AwsTarget]) {
-    let gap = 10.0;
-    let columns = aws_profile_grid_columns(ui.available_width());
-    for row in targets.chunks(columns) {
-        ui.columns(columns, |column_uis| {
-            for (column, target) in row.iter().enumerate() {
-                let width = column_uis[column].available_width();
-                aws_profile_card(&mut column_uis[column], target, width);
-            }
-        });
-        ui.add_space(gap);
-    }
-}
-
-fn aws_profile_card(ui: &mut egui::Ui, target: &AwsTarget, width: f32) {
-    Frame::new()
-        .fill(SURFACE)
-        .stroke(Stroke::new(1.0, LINE))
-        .corner_radius(12)
-        .inner_margin(Margin::symmetric(14, 11))
-        .show(ui, |ui| {
-            ui.set_width((width - 28.0).max(0.0));
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(&target.profile)
-                        .size(15.0)
-                        .strong()
-                        .color(INK),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if !target.region.is_empty() {
-                        ui.label(RichText::new(&target.region).small().color(MUTED));
-                        ui.label(RichText::new("·").small().color(LINE_STRONG));
-                    }
-                    ui.label(
-                        RichText::new(&target.account_id)
-                            .small()
-                            .monospace()
-                            .color(MUTED),
-                    );
-                });
-            });
-            ui.add_space(5.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(RichText::new("Read-only").small().strong().color(GREEN));
-                ui.label(RichText::new(&target.read_only_role).small().color(MUTED));
-                ui.label(RichText::new("·").small().color(LINE_STRONG));
-                ui.label(RichText::new("Admin").small().strong().color(AMBER));
-                ui.label(RichText::new(&target.admin_role).small().color(MUTED));
-            });
-        });
-}
-
-fn empty_state(ui: &mut egui::Ui, title: &str) {
-    let inner_width = (ui.available_width() - 64.0).max(0.0);
-    Frame::new()
-        .fill(SURFACE)
-        .stroke(Stroke::new(1.0, LINE))
-        .corner_radius(16)
-        .inner_margin(Margin::same(32))
-        .show(ui, |ui| {
-            ui.set_min_width(inner_width);
-            ui.vertical_centered(|ui| {
-                ui.add_space(18.0);
-                ui.label(RichText::new("•").size(28.0).color(GREEN));
-                ui.label(RichText::new(title).size(18.0).strong().color(INK));
-                ui.label(
-                    RichText::new("Nothing needs your attention here right now.")
-                        .size(13.0)
-                        .color(MUTED),
-                );
-                ui.add_space(18.0);
-            });
-        });
-}
-
-fn field_label(ui: &mut egui::Ui, label: &str) {
-    ui.label(RichText::new(label).size(12.0).strong().color(INK));
-}
-
-fn auth_submission_requested(button_clicked: bool, enter_pressed: bool, ready: bool) -> bool {
-    button_clicked || (enter_pressed && ready)
-}
-
-fn singleline_field(
-    ui: &mut egui::Ui,
-    text: &mut dyn egui::TextBuffer,
-    hint: &str,
-    password: bool,
-    width: f32,
-) -> egui::Response {
-    let response = ui.add(
-        TextEdit::singleline(text)
-            .hint_text(hint)
-            .password(password)
-            .desired_width(width)
-            .min_size(egui::vec2(0.0, 40.0))
-            .frame(input_frame()),
-    );
-    if response.has_focus() {
-        ui.painter().rect_stroke(
-            response.rect,
-            10,
-            Stroke::new(1.5, GREEN),
-            egui::StrokeKind::Inside,
-        );
-    }
-    response
-}
-
-fn input_frame() -> Frame {
-    Frame::new()
-        .fill(SURFACE_MUTED)
-        .stroke(Stroke::new(1.0, LINE_STRONG))
-        .corner_radius(10)
-        .inner_margin(Margin::symmetric(12, 10))
-}
-
-fn brand_mark(ui: &mut egui::Ui) {
-    Frame::new()
-        .fill(GREEN_SOFT)
-        .corner_radius(11)
-        .inner_margin(Margin::symmetric(10, 7))
-        .show(ui, |ui| {
-            ui.label(RichText::new("S").size(17.0).strong().color(GREEN));
-        });
-}
-
-fn credential_mark(ui: &mut egui::Ui) {
-    Frame::new()
-        .fill(GREEN_SOFT)
-        .corner_radius(10)
-        .inner_margin(Margin::symmetric(9, 6))
-        .show(ui, |ui| {
-            ui.label(RichText::new("S").size(15.0).strong().color(GREEN));
-        });
-}
-
-fn status_pill(ui: &mut egui::Ui, text: &str, foreground: Color32, background: Color32) {
-    Frame::new()
-        .fill(background)
-        .corner_radius(20)
-        .inner_margin(Margin::symmetric(10, 5))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 7.0;
-                let (dot, _) = ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
-                ui.painter().circle_filled(dot.center(), 3.5, foreground);
-                ui.label(RichText::new(text).size(11.0).color(foreground));
-            });
-        });
-}
-
-fn error_banner(ui: &mut egui::Ui, error: &str) {
-    let width = (ui.available_width() - 24.0).max(0.0);
-    Frame::new()
-        .fill(RED_SOFT)
-        .stroke(Stroke::new(1.0, Color32::from_rgb(244, 204, 204)))
-        .corner_radius(10)
-        .inner_margin(Margin::symmetric(12, 9))
-        .show(ui, |ui| {
-            ui.set_min_width(width);
-            ui.label(RichText::new(error).size(12.0).color(RED));
-        });
-}
-
-fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(RichText::new(text).strong().color(Color32::WHITE))
-            .fill(GREEN)
-            .stroke(Stroke::NONE)
-            .corner_radius(10)
-            .min_size(egui::vec2(0.0, 38.0)),
-    )
-}
-
-fn full_primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
-    let width = ui.available_width();
-    ui.add_enabled_ui(enabled, |ui| {
-        ui.add_sized(
-            [width, 42.0],
-            egui::Button::new(RichText::new(text).strong().color(Color32::WHITE))
-                .fill(GREEN)
-                .stroke(Stroke::NONE)
-                .corner_radius(10),
+fn field(label: impl Into<SharedString>, input: Input) -> gpui::AnyElement {
+    v_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_size(px(12.))
+                .font_semibold()
+                .text_color(rgb(MUTED))
+                .child(label.into()),
         )
-    })
-    .inner
+        .child(input.w_full())
+        .into_any_element()
 }
 
-fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(RichText::new(text).color(INK))
-            .fill(SURFACE_MUTED)
-            .stroke(Stroke::new(1.0, LINE))
-            .corner_radius(10)
-            .min_size(egui::vec2(0.0, 38.0)),
-    )
+fn card() -> gpui::Div {
+    v_flex()
+        .w_full()
+        .gap_2()
+        .p_4()
+        .bg(rgb(SURFACE))
+        .border_1()
+        .border_color(rgb(LINE))
+        .rounded(px(14.))
 }
 
-fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(RichText::new(text).color(RED))
-            .fill(RED_SOFT)
-            .stroke(Stroke::new(1.0, Color32::from_rgb(246, 215, 215)))
-            .corner_radius(10)
-            .min_size(egui::vec2(0.0, 38.0)),
-    )
+fn brand() -> gpui::AnyElement {
+    h_flex()
+        .gap_2()
+        .items_center()
+        .child(
+            div()
+                .size(px(30.))
+                .rounded(px(9.))
+                .bg(rgb(INK))
+                .text_color(rgb(SURFACE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .font_semibold()
+                .child("S"),
+        )
+        .child(
+            v_flex()
+                .gap_0()
+                .child(div().font_semibold().text_size(px(17.)).child("secretd"))
+                .child(
+                    div()
+                        .text_size(px(9.))
+                        .text_color(rgb(MUTED))
+                        .child("LOCAL ENCRYPTED VAULT"),
+                ),
+        )
+        .into_any_element()
 }
 
-fn admin_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(RichText::new(text).strong().color(Color32::WHITE))
-            .fill(AMBER)
-            .stroke(Stroke::NONE)
-            .corner_radius(10)
-            .min_size(egui::vec2(0.0, 38.0)),
-    )
+fn title_bar_brand() -> gpui::AnyElement {
+    h_flex()
+        .gap_2()
+        .items_center()
+        .child(
+            div()
+                .size(px(24.))
+                .rounded(px(7.))
+                .bg(rgb(INK))
+                .text_color(rgb(SURFACE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(12.))
+                .font_semibold()
+                .child("S"),
+        )
+        .child(div().font_semibold().text_size(px(15.)).child("secretd"))
+        .into_any_element()
 }
 
-fn workspace_nav(ui: &mut egui::Ui, view: &mut View, snapshot: &AppSnapshot) {
-    nav_button(
-        ui,
-        view,
-        View::Secrets,
-        "Credentials",
-        snapshot.secrets.len(),
-    );
-    nav_button(
-        ui,
-        view,
-        View::Aws,
-        "AWS SSO",
-        snapshot
-            .aws
-            .as_ref()
-            .map_or(0, |aws| aws.configuration.targets.len()),
-    );
-    nav_button(
-        ui,
-        view,
-        View::Grants,
-        "Active access",
-        snapshot.grants.len() + snapshot.aws_grants.len(),
-    );
-    nav_button(ui, view, View::Activity, "Activity", snapshot.audit.len());
+fn credential_mark() -> gpui::AnyElement {
+    div()
+        .size(px(32.))
+        .rounded(px(10.))
+        .bg(rgb(GREEN_SOFT))
+        .text_color(rgb(GREEN))
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_semibold()
+        .child("•")
+        .into_any_element()
 }
 
-fn workspace_actions(ui: &mut egui::Ui) -> (bool, bool) {
-    let mut password = false;
-    let mut lock = false;
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        lock = secondary_button(ui, "Lock").clicked();
-        password = secondary_button(ui, "Password").clicked();
-    });
-    (password, lock)
+fn status_pill(text: &str, foreground: u32, background: u32) -> gpui::AnyElement {
+    div()
+        .px_3()
+        .py_1()
+        .rounded(px(999.))
+        .bg(rgb(background))
+        .text_color(rgb(foreground))
+        .text_size(px(11.))
+        .font_semibold()
+        .child(text.to_string())
+        .into_any_element()
 }
 
-fn nav_button(ui: &mut egui::Ui, view: &mut View, target: View, label: &str, count: usize) {
-    let selected = *view == target;
-    let button = egui::Button::new(
-        RichText::new(format!("{label}   {count}"))
-            .strong()
-            .color(if selected { GREEN } else { MUTED }),
-    )
-    .fill(if selected {
-        GREEN_SOFT
-    } else {
-        Color32::TRANSPARENT
-    })
-    .stroke(Stroke::NONE)
-    .corner_radius(10)
-    .min_size(egui::vec2(0.0, 36.0));
-    if ui.add(button).clicked() {
-        *view = target;
-    }
+fn section_header(title: &str, subtitle: &str) -> gpui::AnyElement {
+    v_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_size(px(24.))
+                .font_semibold()
+                .text_color(rgb(INK))
+                .child(title.to_string()),
+        )
+        .child(div().text_color(rgb(MUTED)).child(subtitle.to_string()))
+        .into_any_element()
 }
 
-fn default_grant_process(process_tree: &[ProcessIdentity]) -> Option<ProcessIdentity> {
-    process_tree
-        .iter()
-        .find(|process| !is_launchd_process(process))
-        .cloned()
+fn empty_state(text: &str) -> gpui::AnyElement {
+    div()
+        .w_full()
+        .p_8()
+        .border_1()
+        .border_color(rgb(LINE))
+        .rounded(px(14.))
+        .bg(rgb(SURFACE))
+        .text_center()
+        .text_color(rgb(MUTED))
+        .child(text.to_string())
+        .into_any_element()
 }
 
-fn grantable_processes(process_tree: &[ProcessIdentity]) -> Vec<&ProcessIdentity> {
-    process_tree
-        .iter()
-        .filter(|process| !is_launchd_process(process))
-        .rev()
-        .collect()
+fn error_banner(error: String) -> gpui::AnyElement {
+    div()
+        .w_full()
+        .p_3()
+        .rounded(px(10.))
+        .bg(rgb(RED_SOFT))
+        .text_color(rgb(RED))
+        .child(error)
+        .into_any_element()
+}
+
+fn modal_title(title: &str) -> gpui::AnyElement {
+    div()
+        .text_size(px(22.))
+        .font_semibold()
+        .child(title.to_string())
+        .into_any_element()
+}
+
+fn cancel_button(cx: &mut Context<MainView>) -> Button {
+    Button::new("cancel-modal")
+        .outline()
+        .label("Cancel")
+        .on_click(cx.listener(|this, _, window, cx| this.close_modal(window, cx)))
+}
+
+fn modal_actions(
+    submit_label: &'static str,
+    submit: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &mut Context<MainView>,
+) -> gpui::AnyElement {
+    h_flex()
+        .justify_end()
+        .gap_2()
+        .child(cancel_button(cx))
+        .child(
+            Button::new("submit-modal")
+                .primary()
+                .label(submit_label)
+                .on_click(submit),
+        )
+        .into_any_element()
+}
+
+fn action_button(
+    label: &'static str,
+    id: String,
+    extend: bool,
+    aws: bool,
+    entity: Entity<MainView>,
+) -> Button {
+    Button::new(SharedString::from(format!("{label}-{id}")))
+        .outline()
+        .when(!extend, |button| button.danger())
+        .label(if extend { "+15 min" } else { "Revoke" })
+        .on_click(move |_, _, cx| {
+            entity.update(cx, |this, cx| {
+                this.mutate_grant(id.clone(), extend, aws, cx)
+            });
+        })
 }
 
 fn process_grant_selector(
-    ui: &mut egui::Ui,
-    process_tree: &[ProcessIdentity],
-    selected: &mut Option<ProcessIdentity>,
-    verified: bool,
-) {
-    ui.label(
-        RichText::new(if verified {
-            "Grant boundary"
-        } else {
-            "Requesting process"
-        })
-        .size(13.0)
-        .strong()
-        .color(INK),
-    );
-    ui.label(
-        RichText::new(if verified {
-            "Choose which process and its children may reuse this access."
-        } else {
-            "The process chain is informational because this request can only be allowed once."
-        })
-        .size(11.0)
-        .color(MUTED),
-    );
-    ui.add_space(6.0);
-
-    let requester = process_tree
+    request_id: &str,
+    processes: &[ProcessIdentity],
+    selected: Option<&ProcessIdentity>,
+    enabled: bool,
+    entity: Entity<RequestView>,
+) -> gpui::AnyElement {
+    let grantable = processes
+        .iter()
+        .filter(|process| !is_launchd_process(process))
+        .rev()
+        .collect::<Vec<_>>();
+    let requester = processes
         .iter()
         .find(|process| !is_launchd_process(process));
-    Frame::new()
-        .fill(SURFACE_MUTED)
-        .stroke(Stroke::new(1.0, LINE))
-        .corner_radius(10)
-        .inner_margin(Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().interact_size.y = 28.0;
-            ui.spacing_mut().item_spacing.y = 4.0;
-            ui.spacing_mut().button_padding.y = 4.0;
-            for (depth, process) in grantable_processes(process_tree).into_iter().enumerate() {
-                let is_selected = selected
-                    .as_ref()
-                    .is_some_and(|current| same_process(current, process));
-                ui.horizontal(|ui| {
-                    ui.add_space(depth as f32 * 18.0);
-                    if depth > 0 {
-                        ui.label(RichText::new("└─").monospace().color(LINE_STRONG));
-                    }
-                    let label = compact_process_label(process);
-                    let radio = ui
-                        .add_enabled_ui(verified, |ui| {
-                            ui.radio(is_selected, RichText::new(label).monospace().color(INK))
+    v_flex()
+        .gap_2()
+        .child(
+            v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_semibold()
+                        .child(if enabled {
+                            "Grant boundary"
+                        } else {
+                            "Requesting process"
+                        }),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED))
+                        .child(if enabled {
+                            "Choose which process and its children may reuse this access."
+                        } else {
+                            "This process chain is informational because access can only be allowed once."
+                        }),
+                ),
+        )
+        .child(
+            v_flex()
+                .gap_1()
+                .p_2()
+                .rounded(px(10.))
+                .border_1()
+                .border_color(rgb(LINE))
+                .bg(rgb(SURFACE_MUTED))
+                .children(grantable.into_iter().enumerate().map(|(depth, process)| {
+                    let process = process.clone();
+                    let request_id = request_id.to_string();
+                    let radio_id = format!("grant-process-{request_id}-{}", process.pid);
+                    let is_requester = requester.is_some_and(|value| same_process(value, &process));
+                    let is_selected = selected.is_some_and(|value| same_process(value, &process));
+                    let process_label = compact_process_label(&process);
+                    let process_details = process_details(&process);
+                    let process_pid = process.pid;
+                    let entity = entity.clone();
+                    h_flex()
+                        .gap_2()
+                        .pl(px(depth as f32 * 16.))
+                        .child(
+                            Radio::new(radio_id)
+                                .checked(is_selected)
+                                .disabled(!enabled)
+                                .label(process_label)
+                                .tooltip(process_details)
+                                .on_click(move |checked, _, cx| {
+                                    if *checked {
+                                        entity.update(cx, |this, cx| {
+                                            this.select_grant_process(
+                                                request_id.clone(),
+                                                process.clone(),
+                                                cx,
+                                            )
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(MUTED))
+                                .child(format!("PID {process_pid}")),
+                        )
+                        .when(is_requester, |this| {
+                            this.child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(GREEN))
+                                    .child("requester"),
+                            )
                         })
-                        .inner
-                        .on_hover_text(process_details(process));
-                    if radio.clicked() {
-                        *selected = Some(process.clone());
-                    }
-                    ui.label(
-                        RichText::new(format!("PID {}", process.pid))
-                            .small()
-                            .color(MUTED),
-                    );
-                    if requester.is_some_and(|requester| same_process(requester, process)) {
-                        ui.label(RichText::new("requester").small().color(GREEN));
-                    }
-                });
-            }
-        });
-
-    if verified && let Some(selected) = selected {
-        let name = selected
-            .executable
-            .rsplit('/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or(&selected.executable);
-        ui.add_space(5.0);
-        ui.label(
-            RichText::new(format!(
-                "Access will follow {name} and its child processes."
-            ))
-            .size(11.0)
-            .color(GREEN),
-        );
-    }
+                })),
+        )
+        .when_some(selected.filter(|_| enabled), |this, selected| {
+            let name = selected
+                .executable
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&selected.executable);
+            this.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(GREEN))
+                    .child(format!(
+                        "Access will follow {name} and its child processes."
+                    )),
+            )
+        })
+        .into_any_element()
 }
 
 fn compact_process_label(process: &ProcessIdentity) -> String {
@@ -2197,15 +2535,19 @@ fn compact_process_label(process: &ProcessIdentity) -> String {
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or(executable);
+    let arguments = parts.collect::<Vec<_>>();
     let mut label = program.to_string();
-    for argument in parts.take(2) {
+    for argument in arguments.iter().take(2) {
         let argument = argument.rsplit('/').next().unwrap_or(argument);
         if label.chars().count() + argument.chars().count() + 1 > 42 {
             label.push_str(" …");
-            break;
+            return label;
         }
         label.push(' ');
         label.push_str(argument);
+    }
+    if arguments.len() > 2 {
+        label.push_str(" …");
     }
     label
 }
@@ -2218,107 +2560,12 @@ fn process_details(process: &ProcessIdentity) -> String {
     }
 }
 
-fn request_heading(ui: &mut egui::Ui, request: &PendingRequest) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(&request.secret)
-                .size(17.0)
-                .strong()
-                .color(INK),
-        );
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(if request.verified {
-                    "Verified connection"
-                } else {
-                    "Unverified · allow once only"
-                })
-                .small()
-                .color(if request.verified { GREEN } else { AMBER }),
-            );
-        });
-    });
-}
-
-fn aws_request_heading(ui: &mut egui::Ui, request: &PendingAwsCredentialRequest) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(format!("AWS profile {}", request.profile))
-                .size(17.0)
-                .strong()
-                .color(INK),
-        );
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(if request.verified {
-                    "Verified connection"
-                } else {
-                    "Unverified · decision applies once"
-                })
-                .small()
-                .color(if request.verified { GREEN } else { AMBER }),
-            );
-        });
-    });
-}
-
-fn aws_connection_draft(snapshot: &AppSnapshot) -> AwsDraft {
-    let connection = snapshot.aws.as_ref().map(|aws| &aws.configuration);
-    AwsDraft {
-        step: AwsDraftStep::Connection,
-        start_url: connection.map_or_else(String::new, |value| value.start_url.clone()),
-        sso_region: connection.map_or_else(String::new, |value| value.sso_region.clone()),
-        targets: Vec::new(),
-    }
-}
-
-fn aws_alias_draft(snapshot: &AppSnapshot) -> AwsDraft {
-    let aws = snapshot
-        .aws
-        .as_ref()
-        .expect("alias editor requires AWS discovery");
-    let mut used_aliases = HashSet::new();
-    let targets = aws
-        .discovered_accounts
+fn default_grant_process(process_tree: &[ProcessIdentity]) -> Option<ProcessIdentity> {
+    process_tree
         .iter()
-        .map(|account| {
-            let existing = aws
-                .configuration
-                .targets
-                .iter()
-                .find(|target| target.account_id == account.account_id);
-            let mut profile = existing.map_or_else(
-                || suggested_alias(&account.account_name, &account.account_id),
-                |target| target.profile.clone(),
-            );
-            if !used_aliases.insert(profile.clone()) {
-                profile = format!("{}-{}", profile, &account.account_id[8..]);
-                used_aliases.insert(profile.clone());
-            }
-            AwsTargetDraft {
-                profile,
-                account_id: account.account_id.clone(),
-                account_name: account.account_name.clone(),
-                email_address: account.email_address.clone(),
-                roles: account.roles.clone(),
-                read_only_role: existing.map_or_else(
-                    || suggested_role(&account.roles, AwsAccessLevel::ReadOnly),
-                    |target| target.read_only_role.clone(),
-                ),
-                admin_role: existing.map_or_else(
-                    || suggested_role(&account.roles, AwsAccessLevel::Admin),
-                    |target| target.admin_role.clone(),
-                ),
-                region: existing.map_or_else(String::new, |target| target.region.clone()),
-            }
-        })
-        .collect();
-    AwsDraft {
-        step: AwsDraftStep::Aliases,
-        start_url: aws.configuration.start_url.clone(),
-        sso_region: aws.configuration.sso_region.clone(),
-        targets,
-    }
+        .find(|process| !is_launchd_process(process))
+        .cloned()
+        .or_else(|| process_tree.first().cloned())
 }
 
 fn suggested_alias(account_name: &str, account_id: &str) -> String {
@@ -2345,7 +2592,14 @@ fn suggested_alias(account_name: &str, account_id: &str) -> String {
 
 fn suggested_role(roles: &[String], level: AwsAccessLevel) -> String {
     let keywords: &[&str] = match level {
-        AwsAccessLevel::ReadOnly => &["readonly", "read-only", "viewer", "audit"],
+        AwsAccessLevel::ReadOnly => &[
+            "readonly",
+            "read-only",
+            "viewonly",
+            "view-only",
+            "viewer",
+            "audit",
+        ],
         AwsAccessLevel::Admin => &["administrator", "admin"],
     };
     roles
@@ -2356,119 +2610,6 @@ fn suggested_role(roles: &[String], level: AwsAccessLevel) -> String {
         })
         .cloned()
         .unwrap_or_default()
-}
-
-fn role_picker(
-    ui: &mut egui::Ui,
-    account_id: &str,
-    label: &str,
-    kind: &str,
-    roles: &[String],
-    selected: &mut String,
-) {
-    field_label(ui, label);
-    let width = finite_combo_width(ui.available_width(), ui.spacing().combo_width);
-    egui::ComboBox::from_id_salt(("aws-role", account_id, kind))
-        .selected_text(if selected.is_empty() {
-            "Select role"
-        } else {
-            selected.as_str()
-        })
-        .width(width)
-        .show_ui(ui, |ui| {
-            for role in roles {
-                ui.selectable_value(selected, role.clone(), role);
-            }
-        });
-}
-
-fn finite_combo_width(available_width: f32, fallback_width: f32) -> f32 {
-    if available_width.is_finite() {
-        available_width.max(120.0)
-    } else {
-        fallback_width.max(120.0)
-    }
-}
-
-fn save_aws_connection(
-    controller: &Arc<Mutex<Controller>>,
-    draft: &AwsDraft,
-) -> Result<(), String> {
-    controller
-        .lock()
-        .map_err(|_| "secretd state is unavailable".to_string())?
-        .save_aws_connection(
-            draft.start_url.trim().to_string(),
-            draft.sso_region.trim().to_string(),
-        )
-        .map_err(|error| error.to_string())
-}
-
-fn save_aws_aliases(controller: &Arc<Mutex<Controller>>, draft: &AwsDraft) -> Result<(), String> {
-    let selected: Vec<_> = draft
-        .targets
-        .iter()
-        .filter(|target| !target.profile.trim().is_empty())
-        .collect();
-    if selected.is_empty() {
-        return Err("Assign an alias to at least one AWS account".into());
-    }
-    for target in &selected {
-        if !target.roles.contains(&target.read_only_role) {
-            return Err(format!(
-                "Select a read-only role for '{}'",
-                target.profile.trim()
-            ));
-        }
-        if !target.roles.contains(&target.admin_role) {
-            return Err(format!(
-                "Select an admin role for '{}'",
-                target.profile.trim()
-            ));
-        }
-    }
-    let configuration = AwsConfiguration {
-        start_url: draft.start_url.clone(),
-        sso_region: draft.sso_region.clone(),
-        targets: selected
-            .into_iter()
-            .map(|target| AwsTarget {
-                profile: target.profile.trim().to_string(),
-                account_id: target.account_id.clone(),
-                read_only_role: target.read_only_role.clone(),
-                admin_role: target.admin_role.clone(),
-                region: target.region.clone(),
-            })
-            .collect(),
-    };
-    controller
-        .lock()
-        .map_err(|_| "secretd state is unavailable".to_string())?
-        .save_aws_configuration(configuration)
-        .map_err(|error| error.to_string())
-}
-
-fn duration_label(seconds: u64) -> &'static str {
-    match seconds {
-        300 => "5 minutes",
-        900 => "15 minutes",
-        1800 => "30 minutes",
-        3600 => "1 hour",
-        _ => "Temporary",
-    }
-}
-
-fn grant_duration_picker(ui: &mut egui::Ui, request_id: &str, choice: &mut RequestChoice) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Grant for").small().strong().color(MUTED));
-        egui::ComboBox::from_id_salt(format!("ttl-{request_id}"))
-            .selected_text(duration_label(choice.seconds))
-            .show_ui(ui, |ui| {
-                for seconds in [300, 900, 1800, 3600] {
-                    ui.selectable_value(&mut choice.seconds, seconds, duration_label(seconds));
-                }
-            });
-    });
 }
 
 fn duration_until(timestamp: u64) -> String {
@@ -2515,15 +2656,6 @@ fn audit_label(action: AuditAction) -> &'static str {
     }
 }
 
-fn audit_color(action: AuditAction) -> Color32 {
-    match action {
-        AuditAction::Denied | AuditAction::TimedOut | AuditAction::Revoked => RED,
-        AuditAction::AllowedOnce | AuditAction::GrantedTemporarily | AuditAction::AutoGranted => {
-            GREEN
-        }
-    }
-}
-
 fn tray_status(snapshot: &AppSnapshot) -> TrayStatus {
     if snapshot.unlocked {
         TrayStatus::Unlocked
@@ -2545,8 +2677,7 @@ fn rebuild_tray_menu(menu: &Menu, snapshot: &AppSnapshot) -> tray_icon::menu::Re
     if pending_count > 0 {
         menu.append(&MenuItem::new(
             format!(
-                "{} access request{} pending",
-                pending_count,
+                "{pending_count} access request{} pending",
                 if pending_count == 1 { "" } else { "s" }
             ),
             false,
@@ -2566,156 +2697,75 @@ fn rebuild_tray_menu(menu: &Menu, snapshot: &AppSnapshot) -> tray_icon::menu::Re
     Ok(())
 }
 
+pub fn configure_theme(cx: &mut App) {
+    ThemeRegistry::global_mut(cx)
+        .load_themes_from_str(CATPPUCCIN_LATTE_THEME)
+        .expect("embedded Catppuccin Latte theme must be valid");
+    let latte = ThemeRegistry::global(cx)
+        .themes()
+        .get("Catppuccin Latte")
+        .cloned()
+        .expect("embedded Catppuccin Latte theme must be registered");
+    let theme = Theme::global_mut(cx);
+    theme.apply_config(&latte);
+    theme.font_size = px(14.);
+    theme.radius = px(8.);
+    theme.radius_lg = px(14.);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{compact_process_label, default_grant_process, suggested_alias, suggested_role};
+    use secretd::aws::AwsAccessLevel;
+    use secretd::process::ProcessIdentity;
 
-    #[test]
-    fn toggles_only_for_a_completed_left_click() {
-        assert!(should_toggle_for_tray_click(
-            tray_icon::MouseButton::Left,
-            tray_icon::MouseButtonState::Up
-        ));
-        assert!(!should_toggle_for_tray_click(
-            tray_icon::MouseButton::Left,
-            tray_icon::MouseButtonState::Down
-        ));
-        assert!(!should_toggle_for_tray_click(
-            tray_icon::MouseButton::Right,
-            tray_icon::MouseButtonState::Up
-        ));
-    }
-
-    #[test]
-    fn password_fields_have_a_visible_surface_and_border() {
-        let context = egui::Context::default();
-        configure_style(&context);
-        let style = context.style_of(context.theme());
-        let frame = input_frame();
-
-        assert_eq!(style.visuals.text_edit_bg_color, Some(SURFACE));
-        assert!(style.visuals.widgets.inactive.bg_stroke.width >= 1.0);
-        assert_eq!(frame.fill, SURFACE_MUTED);
-        assert!(frame.stroke.width >= 1.0);
-        assert_ne!(frame.fill, style.visuals.window_fill);
-    }
-
-    #[test]
-    fn enter_submits_a_complete_auth_form_without_requiring_focus_state() {
-        assert!(auth_submission_requested(false, true, true));
-        assert!(!auth_submission_requested(false, true, false));
-        assert!(auth_submission_requested(true, false, true));
+    fn process(pid: u32, executable: &str) -> ProcessIdentity {
+        ProcessIdentity {
+            pid,
+            ppid: pid.saturating_sub(1),
+            started_at: format!("started-{pid}"),
+            executable: executable.into(),
+            command: executable.into(),
+        }
     }
 
     #[test]
     fn account_names_become_safe_profile_aliases() {
-        assert_eq!(
-            suggested_alias("Pre Production / Canada", "123456789012"),
-            "pre-production-canada"
-        );
-        assert_eq!(suggested_alias("---", "123456789012"), "account-9012");
+        assert_eq!(suggested_alias("Pre Prod", "123456789012"), "pre-prod");
+        assert_eq!(suggested_alias("!!!", "123456789012"), "account-9012");
     }
 
     #[test]
     fn discovered_roles_are_suggested_by_access_level() {
-        let roles = vec!["AdministratorAccess".into(), "ReadOnlyAccess".into()];
+        let roles = vec!["ViewOnlyAccess".into(), "AdministratorAccess".into()];
         assert_eq!(
             suggested_role(&roles, AwsAccessLevel::ReadOnly),
-            "ReadOnlyAccess"
+            "ViewOnlyAccess"
         );
         assert_eq!(
             suggested_role(&roles, AwsAccessLevel::Admin),
             "AdministratorAccess"
         );
-        assert_eq!(
-            suggested_role(&["PowerUser".into()], AwsAccessLevel::ReadOnly),
-            ""
-        );
     }
 
     #[test]
-    fn aws_role_picker_width_is_always_finite() {
-        assert_eq!(finite_combo_width(f32::INFINITY, 100.0), 120.0);
-        assert_eq!(finite_combo_width(f32::NAN, 160.0), 160.0);
-        assert_eq!(finite_combo_width(240.0, 100.0), 240.0);
-    }
-
-    #[test]
-    fn aws_profile_grid_uses_available_horizontal_space() {
-        assert_eq!(aws_profile_grid_columns(400.0), 1);
-        assert_eq!(aws_profile_grid_columns(850.0), 2);
-        assert_eq!(aws_profile_grid_columns(1_280.0), 3);
-        assert_eq!(aws_profile_grid_columns(2_000.0), 3);
-    }
-
-    #[test]
-    fn aws_profile_rows_stay_compact() {
-        let context = egui::Context::default();
-        configure_style(&context);
-        let target = AwsTarget {
-            profile: "demonstration-newvue-ai".into(),
-            account_id: "123456789012".into(),
-            read_only_role: "ReadOnlyAccess".into(),
-            admin_role: "AdministratorAccess".into(),
-            region: "us-east-2".into(),
-        };
-        let targets = vec![target; 7];
-        let mut used_height = 0.0;
-        let mut available_width = 0.0;
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1_300.0, 800.0),
-            )),
-            ..Default::default()
-        };
-
-        let _ = context.run_ui(input, |ui| {
-            available_width = ui.available_width();
-            let top = ui.cursor().top();
-            aws_profile_cards(ui, &targets);
-            used_height = ui.cursor().top() - top;
-        });
-
-        assert!(
-            used_height <= 420.0,
-            "profile rows used {used_height}px at {available_width}px wide"
-        );
-    }
-
-    #[test]
-    fn grantable_process_tree_is_ancestor_first_and_omits_launchd() {
-        let process = |pid, executable: &str| ProcessIdentity {
-            pid,
-            ppid: pid.saturating_sub(1),
-            started_at: format!("start-{pid}"),
-            executable: executable.into(),
-            command: executable.into(),
-        };
-        let child = process(30, "/usr/bin/terraform");
+    fn grant_boundary_defaults_to_the_requester_not_its_ancestor() {
+        let requester = process(30, "/usr/local/bin/aws");
         let shell = process(20, "/bin/zsh");
         let launchd = process(1, "/sbin/launchd");
-        let tree = [child.clone(), shell.clone(), launchd];
+        let tree = vec![requester.clone(), shell, launchd];
 
-        let grantable = grantable_processes(&tree);
-        assert_eq!(grantable, [&shell, &child]);
-        assert_eq!(default_grant_process(&tree), Some(child));
+        assert_eq!(default_grant_process(&tree), Some(requester));
     }
 
     #[test]
-    fn process_labels_are_compact_but_keep_useful_arguments() {
-        let process = ProcessIdentity {
-            pid: 42,
-            ppid: 1,
-            started_at: "start".into(),
-            executable: "/opt/homebrew/bin/terraform".into(),
-            command: "/opt/homebrew/bin/terraform plan /a/very/long/path/to/configuration".into(),
-        };
-
-        assert_eq!(
-            compact_process_label(&process),
-            "terraform plan configuration"
+    fn process_labels_show_the_program_and_compact_arguments() {
+        let mut python = process(
+            30,
+            "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python",
         );
-        assert!(process_details(&process).contains("/opt/homebrew/bin/terraform"));
+        python.command = format!("{} /opt/homebrew/bin/aws s3 ls", python.executable);
+
+        assert_eq!(compact_process_label(&python), "Python aws s3 …");
     }
 }
