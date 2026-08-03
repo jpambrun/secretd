@@ -16,7 +16,19 @@ const MAIN_WINDOW_SIZE: (f32, f32) = (1040., 700.);
 const REQUEST_WINDOW_SIZE: (f32, f32) = (620., 520.);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+#[cfg(target_os = "macos")]
+const QUIT_KEYSTROKE: Option<&str> = Some("cmd-q");
+#[cfg(not(target_os = "macos"))]
+const QUIT_KEYSTROKE: Option<&str> = None;
+
 actions!(secretd, [Quit]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestWindowAction {
+    Open,
+    Close,
+    None,
+}
 
 #[derive(Default)]
 struct Windows {
@@ -51,12 +63,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         };
         cx.set_global(state);
         cx.set_global(Windows::default());
-        cx.bind_keys([
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-q", Quit, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("alt-f4", Quit, None),
-        ]);
+        if let Some(keystroke) = QUIT_KEYSTROKE {
+            cx.bind_keys([KeyBinding::new(keystroke, Quit, None)]);
+        }
         cx.on_action(|_: &Quit, cx| cx.quit());
         observe_closed_windows(cx);
         run_event_loop(receiver, cx);
@@ -203,10 +212,19 @@ fn refresh_views(cx: &mut App) {
 pub(crate) fn reconcile_windows(cx: &mut App) {
     let snapshot = cx.global::<AppState>().snapshot();
     let has_requests = !snapshot.pending.is_empty() || !snapshot.pending_aws.is_empty();
-    if has_requests {
-        open_request(cx);
-    } else {
-        close_request(cx);
+    let request_window_open = cx.global::<Windows>().request.is_some();
+    match request_window_action(has_requests, request_window_open) {
+        RequestWindowAction::Open => open_request(cx),
+        RequestWindowAction::Close => close_request(cx),
+        RequestWindowAction::None => {}
+    }
+}
+
+fn request_window_action(has_requests: bool, request_window_open: bool) -> RequestWindowAction {
+    match (has_requests, request_window_open) {
+        (true, false) => RequestWindowAction::Open,
+        (false, true) => RequestWindowAction::Close,
+        _ => RequestWindowAction::None,
     }
 }
 
@@ -262,11 +280,7 @@ fn toggle_main(cx: &mut App) {
 }
 
 fn open_request(cx: &mut App) {
-    if let Some(handle) = cx.global::<Windows>().request
-        && handle
-            .update(cx, |_, window, _| window.activate_window())
-            .is_ok()
-    {
+    if cx.global::<Windows>().request.is_some() {
         return;
     }
     let bounds = Bounds::centered(
@@ -317,12 +331,41 @@ fn close_request(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAIN_WINDOW_SIZE, REQUEST_WINDOW_SIZE};
+    use super::{
+        MAIN_WINDOW_SIZE, QUIT_KEYSTROKE, REQUEST_WINDOW_SIZE, RequestWindowAction,
+        request_window_action,
+    };
 
     #[test]
     fn request_window_is_compact_relative_to_the_main_window() {
         assert!(REQUEST_WINDOW_SIZE.0 < MAIN_WINDOW_SIZE.0);
         assert!(REQUEST_WINDOW_SIZE.1 < MAIN_WINDOW_SIZE.1);
         assert!(REQUEST_WINDOW_SIZE.1 >= 520.0);
+    }
+
+    #[test]
+    fn existing_request_window_is_left_alone_while_requests_are_pending() {
+        assert_eq!(request_window_action(true, true), RequestWindowAction::None);
+    }
+
+    #[test]
+    fn request_window_tracks_pending_request_transitions() {
+        assert_eq!(
+            request_window_action(true, false),
+            RequestWindowAction::Open
+        );
+        assert_eq!(
+            request_window_action(false, true),
+            RequestWindowAction::Close
+        );
+        assert_eq!(
+            request_window_action(false, false),
+            RequestWindowAction::None
+        );
+    }
+
+    #[test]
+    fn standard_window_close_is_not_bound_to_daemon_quit() {
+        assert_ne!(QUIT_KEYSTROKE, Some("alt-f4"));
     }
 }

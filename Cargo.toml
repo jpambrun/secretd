@@ -1,6 +1,6 @@
 [package]
 name = "secretd"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A native local secret vault with per-request approval"
 license = "MIT"
@@ -26,10 +26,6 @@ getrandom = "0.3"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
-    "font-kit",
-    "runtime_shaders",
-] }
 pbkdf2 = "0.12"
 png = "0.18"
 serde = { version = "1", features = ["derive"] }
@@ -45,11 +41,21 @@ zeroize = "1"
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
+    "font-kit",
+    "runtime_shaders",
+] }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
     "NSResponder",
     "NSRunningApplication",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
+    "wayland",
+    "x11",
 ] }
 
 [dev-dependencies]
