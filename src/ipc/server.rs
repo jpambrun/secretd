@@ -263,6 +263,9 @@ fn handle_aws_request(
         .map_err(|error| error.to_string())?;
     let level = match outcome {
         AwsRequestOutcome::Immediate(level) => level,
+        AwsRequestOutcome::Denied => {
+            return Err("AWS credential request denied".into());
+        }
         AwsRequestOutcome::Pending { id, receiver } => {
             notify();
             match receiver.recv_timeout(AWS_REQUEST_TIMEOUT) {

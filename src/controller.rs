@@ -45,6 +45,7 @@ pub enum AuditAction {
     Denied,
     TimedOut,
     Revoked,
+    Unblocked,
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +86,7 @@ pub enum AwsRequestResolution {
 
 pub enum AwsRequestOutcome {
     Immediate(AwsAccessLevel),
+    Denied,
     Pending {
         id: String,
         receiver: Receiver<AwsRequestResolution>,
@@ -102,6 +104,16 @@ pub struct AwsCredentialGrant {
 }
 
 #[derive(Clone, Debug)]
+pub struct AwsCredentialDenial {
+    pub id: String,
+    pub profile: String,
+    pub process: ProcessIdentity,
+    pub created_at: u64,
+    pub expires_at: u64,
+    process_tree: Vec<ProcessIdentity>,
+}
+
+#[derive(Clone, Debug)]
 pub struct AppSnapshot {
     pub vault_exists: bool,
     pub unlocked: bool,
@@ -110,6 +122,7 @@ pub struct AppSnapshot {
     pub pending_aws: Vec<PendingAwsCredentialRequest>,
     pub grants: Vec<Grant>,
     pub aws_grants: Vec<AwsCredentialGrant>,
+    pub aws_denials: Vec<AwsCredentialDenial>,
     pub audit: Vec<AuditEntry>,
     pub max_grant_seconds: u64,
     pub aws: Option<AwsSettingsSummary>,
@@ -135,6 +148,7 @@ pub struct Controller {
     pending_aws: HashMap<String, PendingAwsCredentialRequest>,
     pending_aws_resolutions: HashMap<String, Sender<AwsRequestResolution>>,
     aws_process_decisions: Vec<AwsCredentialGrant>,
+    aws_process_denials: Vec<AwsCredentialDenial>,
     aws_login: AwsLoginStatus,
 }
 
@@ -151,6 +165,7 @@ impl Controller {
             pending_aws: HashMap::new(),
             pending_aws_resolutions: HashMap::new(),
             aws_process_decisions: Vec::new(),
+            aws_process_denials: Vec::new(),
             aws_login: AwsLoginStatus::Idle,
         }
     }
@@ -158,7 +173,9 @@ impl Controller {
     pub fn snapshot(&mut self) -> AppSnapshot {
         let now = now_millis();
         self.aws_process_decisions
-            .retain(|decision| decision.expires_at > now && process_is_alive(&decision.process));
+            .retain(|decision| decision.expires_at > now);
+        self.aws_process_denials
+            .retain(|denial| denial.expires_at > now);
         let vault_exists = self.vault.exists().unwrap_or(false);
         let unlocked = self.vault.unlocked();
         let secrets = if unlocked {
@@ -189,6 +206,7 @@ impl Controller {
             pending_aws,
             grants: self.grants.list(),
             aws_grants: self.aws_process_decisions.clone(),
+            aws_denials: self.aws_process_denials.clone(),
             audit,
             max_grant_seconds: MAX_GRANT_SECONDS,
             aws,
@@ -226,6 +244,7 @@ impl Controller {
         }
         self.pending_aws.clear();
         self.aws_process_decisions.clear();
+        self.aws_process_denials.clear();
         self.aws_login = AwsLoginStatus::Idle;
     }
 
@@ -275,6 +294,7 @@ impl Controller {
             .map_err(VaultError)?;
         self.vault.save_aws_settings(settings)?;
         self.aws_process_decisions.clear();
+        self.aws_process_denials.clear();
         self.aws_login = AwsLoginStatus::Idle;
         Ok(())
     }
@@ -354,15 +374,24 @@ impl Controller {
         verified: bool,
     ) -> Result<AwsRequestOutcome, VaultError> {
         let profile = normalize_aws_profile(profile)?;
+        self.prune_exited_aws_grants();
         let now = now_millis();
-        self.aws_process_decisions
-            .retain(|decision| decision.expires_at > now && process_is_alive(&decision.process));
+        self.aws_process_denials
+            .retain(|denial| denial.expires_at > now);
         let process_tree = omit_secretd_client_processes(&process_tree);
         let Some(origin) = process_tree.first().cloned() else {
             return Err(VaultError(
                 "Unable to determine the requesting process".into(),
             ));
         };
+        if verified
+            && self.aws_process_denials.iter().any(|denial| {
+                denial.profile == profile
+                    && process_trees_overlap(&denial.process_tree, &process_tree)
+            })
+        {
+            return Ok(AwsRequestOutcome::Denied);
+        }
         if self.vault.unlocked() {
             self.vault
                 .aws_settings()?
@@ -370,12 +399,23 @@ impl Controller {
                 .target(&profile)
                 .map_err(VaultError)?;
             if verified
-                && let Some(decision) = process_tree.iter().find_map(|process| {
-                    self.aws_process_decisions.iter().rev().find(|decision| {
-                        decision.profile == profile && same_process(&decision.process, process)
+                && let Some(decision) = process_tree
+                    .iter()
+                    .find_map(|process| {
+                        self.aws_process_decisions.iter().rev().find(|decision| {
+                            decision.profile == profile && same_process(&decision.process, process)
+                        })
                     })
-                })
+                    .cloned()
             {
+                self.record_audit(AuditEntry {
+                    id: String::new(),
+                    occurred_at: 0,
+                    action: AuditAction::AutoGranted,
+                    secret: aws_audit_resource(&profile),
+                    ttl_seconds: None,
+                    process: origin,
+                });
                 return Ok(AwsRequestOutcome::Immediate(decision.level));
             }
         }
@@ -392,6 +432,12 @@ impl Controller {
         self.pending_aws.insert(id.clone(), request);
         self.pending_aws_resolutions.insert(id.clone(), sender);
         Ok(AwsRequestOutcome::Pending { id, receiver })
+    }
+
+    pub fn prune_exited_aws_grants(&mut self) {
+        let now = now_millis();
+        self.aws_process_decisions
+            .retain(|decision| decision.expires_at > now && process_is_alive(&decision.process));
     }
 
     pub fn respond_aws(
@@ -415,7 +461,7 @@ impl Controller {
                 .ok_or_else(|| VaultError("AWS SSO is not configured in secretd".into()))?
                 .target(&request.profile)
                 .map_err(VaultError)?;
-            if request.verified {
+            let audit_process = if request.verified {
                 let ttl_seconds = validated_grant_seconds(ttl_seconds)?;
                 let grant_process =
                     validated_grant_process(&request.process_tree, &request.origin, grant_process)?;
@@ -428,13 +474,45 @@ impl Controller {
                     id: Uuid::new_v4().to_string(),
                     profile: request.profile.clone(),
                     level,
-                    process: grant_process,
+                    process: grant_process.clone(),
                     created_at: now,
                     expires_at: now.saturating_add(ttl_seconds.saturating_mul(1_000)),
                 });
-            }
+                self.aws_process_denials.retain(|denial| {
+                    denial.profile != request.profile
+                        || !process_trees_overlap(&denial.process_tree, &request.process_tree)
+                });
+                grant_process
+            } else {
+                request.origin.clone()
+            };
+            self.record_audit(AuditEntry {
+                id: String::new(),
+                occurred_at: 0,
+                action: if request.verified {
+                    AuditAction::GrantedTemporarily
+                } else {
+                    AuditAction::AllowedOnce
+                },
+                secret: aws_audit_resource(&request.profile),
+                ttl_seconds: request
+                    .verified
+                    .then_some(ttl_seconds.unwrap_or(DEFAULT_GRANT_SECONDS)),
+                process: audit_process,
+            });
             AwsRequestResolution::Approved(level)
         } else {
+            if request.verified {
+                self.remember_aws_denial(&request);
+            }
+            self.record_audit(AuditEntry {
+                id: String::new(),
+                occurred_at: 0,
+                action: AuditAction::Denied,
+                secret: aws_audit_resource(&request.profile),
+                ttl_seconds: request.verified.then_some(DEFAULT_GRANT_SECONDS),
+                process: request.origin.clone(),
+            });
             AwsRequestResolution::Denied
         };
         self.pending_aws.remove(id);
@@ -445,13 +523,80 @@ impl Controller {
     }
 
     pub fn timeout_aws_request(&mut self, id: &str) {
-        self.pending_aws.remove(id);
+        let Some(request) = self.pending_aws.remove(id) else {
+            return;
+        };
         self.pending_aws_resolutions.remove(id);
+        if request.verified {
+            self.remember_aws_denial(&request);
+        }
+        self.record_audit(AuditEntry {
+            id: String::new(),
+            occurred_at: 0,
+            action: AuditAction::TimedOut,
+            secret: aws_audit_resource(&request.profile),
+            ttl_seconds: request.verified.then_some(DEFAULT_GRANT_SECONDS),
+            process: request.origin,
+        });
+    }
+
+    fn remember_aws_denial(&mut self, request: &PendingAwsCredentialRequest) {
+        self.aws_process_denials.retain(|denial| {
+            denial.profile != request.profile
+                || !process_trees_overlap(&denial.process_tree, &request.process_tree)
+        });
+        let now = now_millis();
+        self.aws_process_denials.push(AwsCredentialDenial {
+            id: Uuid::new_v4().to_string(),
+            profile: request.profile.clone(),
+            process: request.origin.clone(),
+            created_at: now,
+            expires_at: now.saturating_add(DEFAULT_GRANT_SECONDS * 1_000),
+            process_tree: request
+                .process_tree
+                .iter()
+                .filter(|process| !is_launchd_process(process))
+                .cloned()
+                .collect(),
+        });
+    }
+
+    pub fn revoke_aws_denial(&mut self, id: &str) {
+        let Some(index) = self
+            .aws_process_denials
+            .iter()
+            .position(|denial| denial.id == id)
+        else {
+            return;
+        };
+        let denial = self.aws_process_denials.remove(index);
+        self.record_audit(AuditEntry {
+            id: String::new(),
+            occurred_at: 0,
+            action: AuditAction::Unblocked,
+            secret: aws_audit_resource(&denial.profile),
+            ttl_seconds: None,
+            process: denial.process,
+        });
     }
 
     pub fn revoke_aws_grant(&mut self, id: &str) {
-        self.aws_process_decisions
-            .retain(|decision| decision.id != id);
+        let Some(index) = self
+            .aws_process_decisions
+            .iter()
+            .position(|decision| decision.id == id)
+        else {
+            return;
+        };
+        let grant = self.aws_process_decisions.remove(index);
+        self.record_audit(AuditEntry {
+            id: String::new(),
+            occurred_at: 0,
+            action: AuditAction::Revoked,
+            secret: aws_audit_resource(&grant.profile),
+            ttl_seconds: None,
+            process: grant.process,
+        });
     }
 
     pub fn extend_aws_grant(&mut self, id: &str) {
@@ -702,6 +847,15 @@ fn normalize_aws_profile(profile: &str) -> Result<String, VaultError> {
     Ok(profile.to_string())
 }
 
+fn aws_audit_resource(profile: &str) -> String {
+    format!("aws/{profile}")
+}
+
+fn process_trees_overlap(left: &[ProcessIdentity], right: &[ProcessIdentity]) -> bool {
+    left.iter()
+        .any(|left| right.iter().any(|right| same_process(left, right)))
+}
+
 fn validated_grant_process(
     process_tree: &[ProcessIdentity],
     origin: &ProcessIdentity,
@@ -837,6 +991,105 @@ mod tests {
     }
 
     #[test]
+    fn aws_denial_is_audited_and_suppresses_the_same_process_lineage() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(directory.path().join("vault.json"));
+        controller.create_vault("correct horse").unwrap();
+        controller
+            .save_aws_configuration(aws_configuration())
+            .unwrap();
+        let ancestor = live_process();
+        let first_requester = process(20, "/usr/local/bin/aws");
+        let AwsRequestOutcome::Pending { id, receiver } = controller
+            .begin_aws_request(
+                "prod",
+                vec![first_requester.clone(), ancestor.clone()],
+                true,
+            )
+            .unwrap()
+        else {
+            panic!("first request should be pending");
+        };
+
+        controller.respond_aws(&id, None, None, None).unwrap();
+
+        assert_eq!(receiver.recv().unwrap(), AwsRequestResolution::Denied);
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.audit.len(), 1);
+        assert_eq!(snapshot.audit[0].action, AuditAction::Denied);
+        assert_eq!(snapshot.audit[0].secret, "aws/prod");
+        assert_eq!(snapshot.audit[0].ttl_seconds, Some(DEFAULT_GRANT_SECONDS));
+        assert_eq!(snapshot.aws_denials.len(), 1);
+        let denial_id = snapshot.aws_denials[0].id.clone();
+        assert!(matches!(
+            controller
+                .begin_aws_request(
+                    "prod",
+                    vec![process(21, "/usr/local/bin/aws"), ancestor.clone()],
+                    true,
+                )
+                .unwrap(),
+            AwsRequestOutcome::Denied
+        ));
+        assert!(matches!(
+            controller
+                .begin_aws_request(
+                    "prod",
+                    vec![process(22, "/usr/local/bin/aws"), process(23, "/bin/zsh")],
+                    true,
+                )
+                .unwrap(),
+            AwsRequestOutcome::Pending { .. }
+        ));
+
+        controller.revoke_aws_denial(&denial_id);
+
+        let snapshot = controller.snapshot();
+        assert!(snapshot.aws_denials.is_empty());
+        assert_eq!(snapshot.audit[0].action, AuditAction::Unblocked);
+        assert!(matches!(
+            controller
+                .begin_aws_request(
+                    "prod",
+                    vec![process(24, "/usr/local/bin/aws"), ancestor],
+                    true,
+                )
+                .unwrap(),
+            AwsRequestOutcome::Pending { .. }
+        ));
+    }
+
+    #[test]
+    fn aws_timeout_is_audited_and_starts_the_deny_cooldown() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(directory.path().join("vault.json"));
+        controller.create_vault("correct horse").unwrap();
+        controller
+            .save_aws_configuration(aws_configuration())
+            .unwrap();
+        let requester = live_process();
+        let AwsRequestOutcome::Pending { id, .. } = controller
+            .begin_aws_request("prod", vec![requester.clone()], true)
+            .unwrap()
+        else {
+            panic!("first request should be pending");
+        };
+
+        controller.timeout_aws_request(&id);
+
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.audit.len(), 1);
+        assert_eq!(snapshot.audit[0].action, AuditAction::TimedOut);
+        assert_eq!(snapshot.audit[0].secret, "aws/prod");
+        assert!(matches!(
+            controller
+                .begin_aws_request("prod", vec![requester], true)
+                .unwrap(),
+            AwsRequestOutcome::Denied
+        ));
+    }
+
+    #[test]
     fn latest_aws_approval_replaces_an_older_grant() {
         let directory = tempfile::tempdir().unwrap();
         let mut controller = Controller::new(directory.path().join("vault.json"));
@@ -913,7 +1166,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_prunes_aws_grants_for_exited_processes() {
+    fn explicit_cleanup_prunes_exited_aws_grants() {
         let directory = tempfile::tempdir().unwrap();
         let mut controller = Controller::new(directory.path().join("vault.json"));
         controller.aws_process_decisions.push(AwsCredentialGrant {
@@ -932,6 +1185,12 @@ mod tests {
             created_at: now_millis().saturating_sub(DEFAULT_GRANT_SECONDS * 1_000),
             expires_at: now_millis().saturating_sub(1),
         });
+
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.aws_grants.len(), 1);
+        assert_eq!(snapshot.aws_grants[0].id, "stale");
+
+        controller.prune_exited_aws_grants();
 
         assert!(controller.snapshot().aws_grants.is_empty());
     }
