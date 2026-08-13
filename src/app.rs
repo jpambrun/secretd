@@ -295,6 +295,7 @@ struct Toast {
 
 pub struct MainView {
     view: View,
+    last_grant_process_check: Option<Instant>,
     auth_password: Entity<InputState>,
     auth_confirmation: Entity<InputState>,
     search: Entity<InputState>,
@@ -357,6 +358,7 @@ impl MainView {
         ];
         Self {
             view: View::Secrets,
+            last_grant_process_check: None,
             auth_password,
             auth_confirmation,
             search,
@@ -487,8 +489,28 @@ impl MainView {
     }
 
     fn switch_view(&mut self, view: View, cx: &mut Context<Self>) {
+        if view == View::Grants && self.view != View::Grants {
+            self.last_grant_process_check = None;
+        }
         self.view = view;
         cx.notify();
+    }
+
+    fn refresh_grant_liveness(&mut self, cx: &App) {
+        if self.view != View::Grants {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_grant_process_check
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+        {
+            return;
+        }
+        if let Ok(mut controller) = Self::controller(cx).lock() {
+            controller.prune_exited_aws_grants();
+        }
+        self.last_grant_process_check = Some(now);
     }
 
     pub fn show_aws_login(&mut self, cx: &mut Context<Self>) {
@@ -895,7 +917,8 @@ impl MainView {
 
     fn render_header(&self, snapshot: &AppSnapshot, cx: &mut Context<Self>) -> gpui::AnyElement {
         let entity = cx.entity();
-        let active_count = snapshot.grants.len() + snapshot.aws_grants.len();
+        let active_count =
+            snapshot.grants.len() + snapshot.aws_grants.len() + snapshot.aws_denials.len();
         let activity_count = snapshot.audit.len();
         let badge_color = cx.theme().muted_foreground;
         let selected_index = match self.view {
@@ -933,7 +956,7 @@ impl MainView {
                             .child(Tab::new().label("AWS SSO"))
                             .child(
                                 Tab::new()
-                                    .aria_label(format!("Active, {active_count}"))
+                                    .aria_label(format!("Grants, {active_count}"))
                                     .child(
                                         Badge::new()
                                             .count(active_count)
@@ -942,7 +965,7 @@ impl MainView {
                                             .child(
                                                 div()
                                                     .when(active_count > 0, |this| this.pr_3())
-                                                    .child("Active"),
+                                                    .child("Grants"),
                                             ),
                                     ),
                             )
@@ -1405,12 +1428,14 @@ impl MainView {
         v_flex()
             .gap_4()
             .child(section_header(
-                "Active access",
-                "Grants follow the selected process and its children for at most 60 minutes.",
+                "Grants",
+                "Manage temporary access grants and remembered denials.",
             ))
             .when(
-                snapshot.grants.is_empty() && snapshot.aws_grants.is_empty(),
-                |this| this.child(empty_state("No active grants")),
+                snapshot.grants.is_empty()
+                    && snapshot.aws_grants.is_empty()
+                    && snapshot.aws_denials.is_empty(),
+                |this| this.child(empty_state("No active grants or blocks")),
             )
             .children(snapshot.aws_grants.iter().map(|grant| {
                 let revoke_id = grant.id.clone();
@@ -1420,20 +1445,35 @@ impl MainView {
                         .gap_3()
                         .child(
                             v_flex()
+                                .min_w_0()
+                                .flex_1()
                                 .gap_1()
-                                .child(div().font_semibold().child(format!(
-                                    "AWS {} · {} credentials",
-                                    grant.profile,
-                                    grant.level.label()
-                                )))
-                                .child(div().text_color(rgb(MUTED)).child(format!(
-                                    "{} · PID {} · expires in {}",
-                                    grant.process.executable,
-                                    grant.process.pid,
-                                    duration_until(grant.expires_at)
-                                ))),
+                                .child(
+                                    div()
+                                        .font_semibold()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .child(format!(
+                                            "AWS {} · {} credentials",
+                                            grant.profile,
+                                            grant.level.label()
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(rgb(MUTED))
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .child(format!(
+                                            "{} · PID {} · expires in {}",
+                                            compact_process_label(&grant.process),
+                                            grant.process.pid,
+                                            duration_until(grant.expires_at)
+                                        )),
+                                ),
                         )
-                        .child(div().flex_1())
                         .child(action_button(
                             "Extend",
                             extend_id,
@@ -1458,16 +1498,31 @@ impl MainView {
                         .gap_3()
                         .child(
                             v_flex()
+                                .min_w_0()
+                                .flex_1()
                                 .gap_1()
-                                .child(div().font_semibold().child(grant.resource.clone()))
-                                .child(div().text_color(rgb(MUTED)).child(format!(
-                                    "{} · PID {} · expires in {}",
-                                    grant.process.executable,
-                                    grant.process.pid,
-                                    duration_until(grant.expires_at)
-                                ))),
+                                .child(
+                                    div()
+                                        .font_semibold()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .child(grant.resource.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(rgb(MUTED))
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .child(format!(
+                                            "{} · PID {} · expires in {}",
+                                            compact_process_label(&grant.process),
+                                            grant.process.pid,
+                                            duration_until(grant.expires_at)
+                                        )),
+                                ),
                         )
-                        .child(div().flex_1())
                         .child(action_button(
                             "Extend",
                             extend_id,
@@ -1484,7 +1539,62 @@ impl MainView {
                         )),
                 )
             }))
+            .children(snapshot.aws_denials.iter().map(|denial| {
+                let denial_id = denial.id.clone();
+                let entity = entity.clone();
+                card().child(
+                    h_flex()
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .flex_1()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .font_semibold()
+                                        .text_color(rgb(RED))
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .child(format!("Blocked · AWS {}", denial.profile)),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(rgb(MUTED))
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .child(format!(
+                                            "{} · PID {} · expires in {}",
+                                            compact_process_label(&denial.process),
+                                            denial.process.pid,
+                                            duration_until(denial.expires_at)
+                                        )),
+                                ),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("unblock-{denial_id}")))
+                                .flex_shrink_0()
+                                .outline()
+                                .label("Unblock")
+                                .on_click(move |_, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.unblock_aws_denial(denial_id.clone(), cx)
+                                    });
+                                }),
+                        ),
+                )
+            }))
             .into_any_element()
+    }
+
+    fn unblock_aws_denial(&mut self, id: String, cx: &mut Context<Self>) {
+        if let Ok(mut controller) = Self::controller(cx).lock() {
+            controller.revoke_aws_denial(&id);
+        }
+        Self::signal(cx);
+        cx.notify();
     }
 
     fn mutate_grant(&mut self, id: String, extend: bool, aws: bool, cx: &mut Context<Self>) {
@@ -1539,7 +1649,8 @@ impl MainView {
                     )
                     .child(div().text_color(rgb(MUTED)).child(format!(
                         "{} · PID {}",
-                        entry.process.executable, entry.process.pid
+                        compact_process_label(&entry.process),
+                        entry.process.pid
                     )))
             }))
             .into_any_element()
@@ -1741,6 +1852,7 @@ impl Render for MainView {
         {
             self.toast = None;
         }
+        self.refresh_grant_liveness(cx);
         let snapshot = Self::snapshot(cx);
         if !snapshot.vault_exists || !snapshot.unlocked {
             return v_flex()
@@ -2063,14 +2175,23 @@ impl RequestView {
                 h_flex()
                     .gap_2()
                     .flex_wrap()
-                    .child(Button::new("deny-aws").danger().label("Deny").on_click({
-                        let entity = entity.clone();
-                        move |_, _, cx| {
-                            entity.update(cx, |this, cx| {
-                                this.respond_aws(deny_id.clone(), None, None, cx)
-                            });
-                        }
-                    }))
+                    .child(
+                        Button::new("deny-aws")
+                            .danger()
+                            .label(if request.verified {
+                                "Deny for 30 min"
+                            } else {
+                                "Deny"
+                            })
+                            .on_click({
+                                let entity = entity.clone();
+                                move |_, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.respond_aws(deny_id.clone(), None, None, cx)
+                                    });
+                                }
+                            }),
+                    )
                     .when(unlocked, |this| {
                         this.child(
                             Button::new("read-aws")
@@ -2396,6 +2517,7 @@ fn action_button(
     entity: Entity<MainView>,
 ) -> Button {
     Button::new(SharedString::from(format!("{label}-{id}")))
+        .flex_shrink_0()
         .outline()
         .when(!extend, |button| button.danger())
         .label(if extend { "+15 min" } else { "Revoke" })
@@ -2653,6 +2775,7 @@ fn audit_label(action: AuditAction) -> &'static str {
         AuditAction::Denied => "Request denied",
         AuditAction::TimedOut => "Request timed out",
         AuditAction::Revoked => "Access revoked",
+        AuditAction::Unblocked => "Block removed",
     }
 }
 

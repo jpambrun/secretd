@@ -86,7 +86,10 @@ The selected role is pinned to the chosen process boundary and its children. New
 the active-access screen (up to 60 minutes remaining). A later Terraform invocation does not reuse
 the grant unless it is still a descendant of the selected live process boundary. Already-issued AWS
 role credentials remain usable until their AWS-provided expiration time; revoking or expiring a
-grant prevents secretd from issuing another set automatically.
+grant prevents secretd from issuing another set automatically. A denial or unanswered request is
+remembered for 30 minutes for the same verified process lineage and profile, preventing retry loops
+from repeatedly opening approval windows. Active grants and remembered denials appear under
+**Grants**, where they can be revoked or unblocked immediately.
 
 The generic secret vault and `get` request remain compatible with the Deno implementation. Vaults
 that contain the Rust application's AWS extension require an AWS-aware secretd version.
