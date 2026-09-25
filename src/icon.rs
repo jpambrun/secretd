@@ -43,7 +43,7 @@ fn decode_tray_icon(status: TrayStatus) -> Result<(Vec<u8>, u32, u32), String> {
         TrayStatus::Locked => [45, 45, 48],
         TrayStatus::Unlocked => [235, 235, 240],
     };
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         if pixel[3] != 0 {
             pixel[..3].copy_from_slice(&color);
         }
@@ -68,9 +68,16 @@ mod tests {
     fn uses_dark_locked_and_light_unlocked_pixels() {
         let (locked, _, _) = decode_tray_icon(TrayStatus::Locked).unwrap();
         let (unlocked, _, _) = decode_tray_icon(TrayStatus::Unlocked).unwrap();
-        let locked_pixel = locked.chunks_exact(4).find(|pixel| pixel[3] != 0).unwrap();
+        let locked_pixel = locked
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .find(|pixel| pixel[3] != 0)
+            .unwrap();
         let unlocked_pixel = unlocked
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .find(|pixel| pixel[3] != 0)
             .unwrap();
 
