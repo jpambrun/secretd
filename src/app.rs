@@ -5,24 +5,23 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gpui::{
-    App, AppContext, Context, Entity, Focusable as _, Global, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, div,
-    prelude::FluentBuilder as _, px, rgb,
-};
-use gpui_component::{
+use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, Theme, ThemeRegistry,
     TitleBar,
-    badge::Badge,
     button::{Button, ButtonVariants as _},
     group_box::{GroupBox, GroupBoxVariants as _},
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
     radio::Radio,
     scroll::ScrollableElement as _,
     tab::{Tab, TabBar},
     v_flex,
+};
+use gpui_kit::{
+    App, AppContext, Context, Entity, Focusable as _, Global, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, Styled, Subscription, Window, div,
+    prelude::FluentBuilder as _, px, rgb,
 };
 use tray_icon::{
     TrayIcon, TrayIconBuilder, TrayIconEvent,
@@ -300,7 +299,7 @@ pub struct MainView {
     auth_confirmation: Entity<InputState>,
     search: Entity<InputState>,
     secret_name: Entity<InputState>,
-    secret_value: Entity<InputState>,
+    secret_value: Entity<TextareaState>,
     new_password: Entity<InputState>,
     password_confirmation: Entity<InputState>,
     aws_start_url: Entity<InputState>,
@@ -364,11 +363,7 @@ impl MainView {
             search,
             secret_name: cx
                 .new(|cx| InputState::new(window, cx).placeholder("service/account/token")),
-            secret_value: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Secret value")
-                    .multi_line(true)
-            }),
+            secret_value: cx.new(|cx| TextareaState::new(window, cx).placeholder("Secret value")),
             new_password: cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("Enter a new password")
@@ -423,12 +418,13 @@ impl MainView {
             &self.auth_password,
             &self.auth_confirmation,
             &self.secret_name,
-            &self.secret_value,
             &self.new_password,
             &self.password_confirmation,
         ] {
             Self::set_input(input, "", window, cx);
         }
+        self.secret_value
+            .update(cx, |input, cx| input.set_value("", window, cx));
         self.aws_aliases.clear();
         self.modal = None;
         self.revealed = None;
@@ -451,7 +447,12 @@ impl MainView {
         cx.notify();
     }
 
-    fn submit_auth(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn submit_auth(
+        &mut self,
+        _: &gpui_kit::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.submit_auth_form(window, cx);
     }
 
@@ -542,18 +543,24 @@ impl MainView {
             (String::new(), String::new())
         };
         Self::set_input(&self.secret_name, name, window, cx);
-        Self::set_input(&self.secret_value, value, window, cx);
+        self.secret_value
+            .update(cx, |input, cx| input.set_value(value, window, cx));
         self.form_error = None;
         self.modal = Some(Modal::Secret { original_name });
         cx.notify();
     }
 
-    fn save_secret(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn save_secret(
+        &mut self,
+        _: &gpui_kit::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(Modal::Secret { original_name }) = self.modal.clone() else {
             return;
         };
         let name = Self::input_value(&self.secret_name, cx);
-        let value = Zeroizing::new(Self::input_value(&self.secret_value, cx));
+        let value = Zeroizing::new(self.secret_value.read(cx).value().to_string());
         let result = Self::controller(cx)
             .lock()
             .map_err(|_| "secretd state is unavailable".to_string())
@@ -565,7 +572,8 @@ impl MainView {
         match result {
             Ok(()) => {
                 Self::set_input(&self.secret_name, "", window, cx);
-                Self::set_input(&self.secret_value, "", window, cx);
+                self.secret_value
+                    .update(cx, |input, cx| input.set_value("", window, cx));
                 self.modal = None;
                 self.revealed = None;
                 self.form_error = None;
@@ -629,7 +637,12 @@ impl MainView {
         cx.notify();
     }
 
-    fn save_password(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn save_password(
+        &mut self,
+        _: &gpui_kit::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let password = Zeroizing::new(Self::input_value(&self.new_password, cx));
         let confirmation = Zeroizing::new(Self::input_value(&self.password_confirmation, cx));
         if *password != *confirmation {
@@ -680,7 +693,7 @@ impl MainView {
 
     fn save_aws_connection(
         &mut self,
-        _: &gpui::ClickEvent,
+        _: &gpui_kit::ClickEvent,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -765,7 +778,12 @@ impl MainView {
         cx.notify();
     }
 
-    fn save_aws_aliases(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn save_aws_aliases(
+        &mut self,
+        _: &gpui_kit::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let snapshot = Self::snapshot(cx);
         let Some(aws) = snapshot.aws else {
             self.form_error = Some("AWS connection is no longer available".into());
@@ -831,7 +849,8 @@ impl MainView {
     fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.modal, Some(Modal::Secret { .. })) {
             Self::set_input(&self.secret_name, "", window, cx);
-            Self::set_input(&self.secret_value, "", window, cx);
+            self.secret_value
+                .update(cx, |input, cx| input.set_value("", window, cx));
         }
         if matches!(self.modal, Some(Modal::Password)) {
             Self::set_input(&self.new_password, "", window, cx);
@@ -843,7 +862,7 @@ impl MainView {
         cx.notify();
     }
 
-    fn render_auth(&self, creating: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_auth(&self, creating: bool, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         v_flex()
             .size_full()
             .items_center()
@@ -915,7 +934,11 @@ impl MainView {
             .into_any_element()
     }
 
-    fn render_header(&self, snapshot: &AppSnapshot, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_header(
+        &self,
+        snapshot: &AppSnapshot,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         let entity = cx.entity();
         let active_count =
             snapshot.grants.len() + snapshot.aws_grants.len() + snapshot.aws_denials.len();
@@ -954,36 +977,8 @@ impl MainView {
                             })
                             .child(Tab::new().label("Credentials"))
                             .child(Tab::new().label("AWS SSO"))
-                            .child(
-                                Tab::new()
-                                    .aria_label(format!("Grants, {active_count}"))
-                                    .child(
-                                        Badge::new()
-                                            .count(active_count)
-                                            .max(999)
-                                            .color(badge_color)
-                                            .child(
-                                                div()
-                                                    .when(active_count > 0, |this| this.pr_3())
-                                                    .child("Grants"),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                Tab::new()
-                                    .aria_label(format!("Activity, {activity_count}"))
-                                    .child(
-                                        Badge::new()
-                                            .count(activity_count)
-                                            .max(999)
-                                            .color(badge_color)
-                                            .child(
-                                                div()
-                                                    .when(activity_count > 0, |this| this.pr_3())
-                                                    .child("Activity"),
-                                            ),
-                                    ),
-                            ),
+                            .child(counted_tab("Grants", active_count, badge_color))
+                            .child(counted_tab("Activity", activity_count, badge_color)),
                     )
                     .child(div().flex_1())
                     .child(
@@ -1008,7 +1003,11 @@ impl MainView {
             .into_any_element()
     }
 
-    fn render_secrets(&self, snapshot: &AppSnapshot, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_secrets(
+        &self,
+        snapshot: &AppSnapshot,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         let query = Self::input_value(&self.search, cx).to_ascii_lowercase();
         let visible: Vec<_> = snapshot
             .secrets
@@ -1138,7 +1137,7 @@ impl MainView {
             .into_any_element()
     }
 
-    fn render_aws(&self, snapshot: &AppSnapshot, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_aws(&self, snapshot: &AppSnapshot, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let login_in_progress = matches!(
             snapshot.aws_login,
             AwsLoginStatus::Starting
@@ -1423,7 +1422,11 @@ impl MainView {
             .into_any_element()
     }
 
-    fn render_grants(&self, snapshot: &AppSnapshot, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_grants(
+        &self,
+        snapshot: &AppSnapshot,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         let entity = cx.entity();
         v_flex()
             .gap_4()
@@ -1612,7 +1615,7 @@ impl MainView {
         cx.notify();
     }
 
-    fn render_activity(&self, snapshot: &AppSnapshot) -> gpui::AnyElement {
+    fn render_activity(&self, snapshot: &AppSnapshot) -> gpui_kit::AnyElement {
         v_flex()
             .gap_4()
             .child(section_header(
@@ -1656,7 +1659,7 @@ impl MainView {
             .into_any_element()
     }
 
-    fn render_modal(&self, modal: &Modal, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_modal(&self, modal: &Modal, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let body = match modal {
             Modal::Secret { original_name } => v_flex()
                 .gap_4()
@@ -1666,7 +1669,10 @@ impl MainView {
                     "New credential"
                 }))
                 .child(field("Name", Input::new(&self.secret_name)))
-                .child(field("Value", Input::new(&self.secret_value).h(px(150.))))
+                .child(field(
+                    "Value",
+                    Textarea::new(&self.secret_value).h(px(150.)),
+                ))
                 .when_some(self.form_error.clone(), |this, error| {
                     this.child(error_banner(error))
                 })
@@ -1820,7 +1826,7 @@ impl MainView {
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::rgba(0x15211b66))
+            .bg(gpui_kit::rgba(0x15211b66))
             .occlude()
             .child(
                 div()
@@ -2027,7 +2033,7 @@ impl RequestView {
         request: &PendingRequest,
         unlocked: bool,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let entity = cx.entity();
         let process = self.grant_process(&request.id, &request.process_tree);
         let deny_id = request.id.clone();
@@ -2139,7 +2145,7 @@ impl RequestView {
         request: &PendingAwsCredentialRequest,
         unlocked: bool,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let entity = cx.entity();
         let process = self.grant_process(&request.id, &request.process_tree);
         let deny_id = request.id.clone();
@@ -2334,7 +2340,33 @@ pub fn dismiss_oldest_request(cx: &mut App) {
     (cx.global::<AppState>().notify())();
 }
 
-fn field(label: impl Into<SharedString>, input: Input) -> gpui::AnyElement {
+fn counted_tab(label: &'static str, count: usize, color: gpui_kit::Hsla) -> Tab {
+    Tab::new()
+        .label(label)
+        .aria_label(format!("{label}, {count}"))
+        .when(count > 0, |tab| {
+            tab.suffix(
+                h_flex()
+                    .flex_shrink_0()
+                    .min_w(px(16.))
+                    .h(px(16.))
+                    .px_1()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(color)
+                    .text_color(rgb(0xffffff))
+                    .text_size(px(10.))
+                    .line_height(gpui_kit::relative(1.))
+                    .child(if count > 999 {
+                        "999+".into()
+                    } else {
+                        count.to_string()
+                    }),
+            )
+        })
+}
+
+fn field(label: impl Into<SharedString>, input: impl IntoElement + Styled) -> gpui_kit::AnyElement {
     v_flex()
         .gap_1()
         .child(
@@ -2348,7 +2380,7 @@ fn field(label: impl Into<SharedString>, input: Input) -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn card() -> gpui::Div {
+fn card() -> gpui_kit::Div {
     v_flex()
         .w_full()
         .gap_2()
@@ -2359,7 +2391,7 @@ fn card() -> gpui::Div {
         .rounded(px(14.))
 }
 
-fn brand() -> gpui::AnyElement {
+fn brand() -> gpui_kit::AnyElement {
     h_flex()
         .gap_2()
         .items_center()
@@ -2389,7 +2421,7 @@ fn brand() -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn title_bar_brand() -> gpui::AnyElement {
+fn title_bar_brand() -> gpui_kit::AnyElement {
     h_flex()
         .gap_2()
         .items_center()
@@ -2410,7 +2442,7 @@ fn title_bar_brand() -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn credential_mark() -> gpui::AnyElement {
+fn credential_mark() -> gpui_kit::AnyElement {
     div()
         .size(px(32.))
         .rounded(px(10.))
@@ -2424,7 +2456,7 @@ fn credential_mark() -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn status_pill(text: &str, foreground: u32, background: u32) -> gpui::AnyElement {
+fn status_pill(text: &str, foreground: u32, background: u32) -> gpui_kit::AnyElement {
     div()
         .px_3()
         .py_1()
@@ -2437,7 +2469,7 @@ fn status_pill(text: &str, foreground: u32, background: u32) -> gpui::AnyElement
         .into_any_element()
 }
 
-fn section_header(title: &str, subtitle: &str) -> gpui::AnyElement {
+fn section_header(title: &str, subtitle: &str) -> gpui_kit::AnyElement {
     v_flex()
         .gap_1()
         .child(
@@ -2451,7 +2483,7 @@ fn section_header(title: &str, subtitle: &str) -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn empty_state(text: &str) -> gpui::AnyElement {
+fn empty_state(text: &str) -> gpui_kit::AnyElement {
     div()
         .w_full()
         .p_8()
@@ -2465,7 +2497,7 @@ fn empty_state(text: &str) -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn error_banner(error: String) -> gpui::AnyElement {
+fn error_banner(error: String) -> gpui_kit::AnyElement {
     div()
         .w_full()
         .p_3()
@@ -2476,7 +2508,7 @@ fn error_banner(error: String) -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn modal_title(title: &str) -> gpui::AnyElement {
+fn modal_title(title: &str) -> gpui_kit::AnyElement {
     div()
         .text_size(px(22.))
         .font_semibold()
@@ -2493,9 +2525,9 @@ fn cancel_button(cx: &mut Context<MainView>) -> Button {
 
 fn modal_actions(
     submit_label: &'static str,
-    submit: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    submit: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static,
     cx: &mut Context<MainView>,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     h_flex()
         .justify_end()
         .gap_2()
@@ -2534,7 +2566,7 @@ fn process_grant_selector(
     selected: Option<&ProcessIdentity>,
     enabled: bool,
     entity: Entity<RequestView>,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let grantable = processes
         .iter()
         .filter(|process| !is_launchd_process(process))

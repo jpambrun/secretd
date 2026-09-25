@@ -6,7 +6,7 @@ use std::{
 };
 
 use aes_gcm::{
-    Aes256Gcm, KeyInit,
+    Aes256Gcm, KeyInit, Nonce,
     aead::{Aead, Payload},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -158,9 +158,8 @@ impl VaultStore {
                 .decode(&file.cipher.iv)
                 .map_err(|_| VaultError("Vault IV is invalid".into()))?,
         );
-        if iv.len() != 12 {
-            return Err(VaultError("Vault IV is invalid".into()));
-        }
+        let nonce = <&Nonce<_>>::try_from(iv.as_slice())
+            .map_err(|_| VaultError("Vault IV is invalid".into()))?;
         let ciphertext = Zeroizing::new(
             BASE64
                 .decode(&file.ciphertext)
@@ -173,7 +172,7 @@ impl VaultStore {
         let plaintext = Zeroizing::new(
             cipher
                 .decrypt(
-                    iv.as_slice().into(),
+                    nonce,
                     Payload {
                         msg: &ciphertext,
                         aad: aad.as_bytes(),
@@ -446,7 +445,7 @@ fn save_with(
     let ciphertext = Zeroizing::new(
         cipher
             .encrypt(
-                iv.as_slice().into(),
+                (&*iv).into(),
                 Payload {
                     msg: &plaintext,
                     aad: aad.as_bytes(),

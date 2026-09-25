@@ -15,24 +15,22 @@ name = "secretd"
 path = "src/bin/secretd.rs"
 
 [dependencies]
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 anyhow = "1"
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
 aws-sdk-sso = "1"
 aws-sdk-ssooidc = "1"
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-getrandom = "0.3"
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui-component = { git = "https://github.com/longbridge/gpui-component" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
-pbkdf2 = "0.12"
+getrandom = "0.4"
+gpui-kit = "0.6.6"
+pbkdf2 = "0.13"
 png = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2"
-tray-icon = "0.24"
+tray-icon = "0.25"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
@@ -41,21 +39,11 @@ zeroize = "1"
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
-    "font-kit",
-    "runtime_shaders",
-] }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
     "NSResponder",
     "NSRunningApplication",
-] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
-    "wayland",
-    "x11",
 ] }
 
 [dev-dependencies]

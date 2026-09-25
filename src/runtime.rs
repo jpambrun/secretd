@@ -4,11 +4,11 @@ use std::{
     time::Duration,
 };
 
-use gpui::{
+use gpui_kit::component::{Root, TitleBar};
+use gpui_kit::{
     App, AppContext as _, Bounds, Entity, Global, KeyBinding, QuitMode, WeakEntity, WindowBounds,
     WindowHandle, WindowKind, WindowOptions, actions, px, size,
 };
-use gpui_component::{Root, TitleBar};
 
 use crate::app::{
     AppEvent, AppState, MainView, RequestView, configure_theme, dismiss_oldest_request,
@@ -47,13 +47,13 @@ impl Global for Windows {}
 pub fn run() -> Result<(), Box<dyn Error>> {
     let (sender, receiver) = mpsc::channel();
     let show_on_launch = std::env::args().any(|argument| argument == "--show");
-    let app = gpui_platform::application()
-        .with_assets(gpui_component_assets::Assets)
+    let app = gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
         .with_quit_mode(QuitMode::Explicit);
 
     app.run(move |cx| {
         configure_platform_application();
-        gpui_component::init(cx);
+        gpui_kit::init(cx);
         configure_theme(cx);
         let state = match AppState::new(sender) {
             Ok(state) => state,
