@@ -61,10 +61,9 @@ jobs:
       - name: Build macOS archive
         if: runner.os == 'macOS'
         run: |
-          sh scripts/package-macos.sh
+          cargo build --locked --release --bin secretd
           mkdir -p staging/secretd-macos
-          cp -R dist/secretd.app staging/secretd-macos/
-          cp dist/bin/secretd README.md LICENSE staging/secretd-macos/
+          cp target/release/secretd README.md LICENSE staging/secretd-macos/
           tar -C staging -czf secretd-macos.tar.gz secretd-macos
 
       - name: Upload release archive

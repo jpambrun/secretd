@@ -22,6 +22,3 @@ install: build
     mkdir -p "{{install_dir}}"
     install -m 755 target/release/secretd "{{install_dir}}/secretd"
     @echo "Installed secretd to {{install_dir}}/secretd"
-
-package-macos:
-    sh scripts/package-macos.sh

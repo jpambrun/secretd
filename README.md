@@ -23,11 +23,10 @@ Use `secretd --show` to launch the tray service with its window open. Desktop la
 the invoking terminal; use `secretd desktop --foreground` when attached logs are useful for
 development or diagnostics.
 
-On macOS, package the same executable as both `dist/secretd.app/Contents/MacOS/secretd` and the
-standalone `dist/bin/secretd` with:
+On macOS, build and install the single executable with:
 
 ```sh
-just package-macos
+just install
 ```
 
 Tagged releases publish Linux x86-64 and macOS archives on the
