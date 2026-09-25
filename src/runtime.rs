@@ -10,7 +10,9 @@ use gpui::{
 };
 use gpui_component::{Root, TitleBar};
 
-use crate::app::{AppEvent, AppState, MainView, RequestView, configure_theme, deny_oldest_request};
+use crate::app::{
+    AppEvent, AppState, MainView, RequestView, configure_theme, dismiss_oldest_request,
+};
 
 const MAIN_WINDOW_SIZE: (f32, f32) = (1040., 700.);
 const REQUEST_WINDOW_SIZE: (f32, f32) = (620., 520.);
@@ -114,7 +116,7 @@ fn observe_closed_windows(cx: &mut App) {
             // The view drops its GPUI input buffers here. The controller and IPC server are global.
         }
         if was_request && !intentional {
-            deny_oldest_request(cx);
+            dismiss_oldest_request(cx);
         }
     })
     .detach();

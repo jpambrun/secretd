@@ -447,6 +447,21 @@ impl Controller {
         grant_process: Option<ProcessIdentity>,
         ttl_seconds: Option<u64>,
     ) -> Result<(), VaultError> {
+        self.respond_aws_with_denial(id, level, grant_process, ttl_seconds, true)
+    }
+
+    pub fn dismiss_aws_request(&mut self, id: &str) -> Result<(), VaultError> {
+        self.respond_aws_with_denial(id, None, None, None, false)
+    }
+
+    fn respond_aws_with_denial(
+        &mut self,
+        id: &str,
+        level: Option<AwsAccessLevel>,
+        grant_process: Option<ProcessIdentity>,
+        ttl_seconds: Option<u64>,
+        remember_denial: bool,
+    ) -> Result<(), VaultError> {
         let request = self
             .pending_aws
             .get(id)
@@ -502,7 +517,7 @@ impl Controller {
             });
             AwsRequestResolution::Approved(level)
         } else {
-            if request.verified {
+            if request.verified && remember_denial {
                 self.remember_aws_denial(&request);
             }
             self.record_audit(AuditEntry {
@@ -510,7 +525,7 @@ impl Controller {
                 occurred_at: 0,
                 action: AuditAction::Denied,
                 secret: aws_audit_resource(&request.profile),
-                ttl_seconds: request.verified.then_some(DEFAULT_GRANT_SECONDS),
+                ttl_seconds: (request.verified && remember_denial).then_some(DEFAULT_GRANT_SECONDS),
                 process: request.origin.clone(),
             });
             AwsRequestResolution::Denied
@@ -1054,6 +1069,37 @@ mod tests {
                     vec![process(24, "/usr/local/bin/aws"), ancestor],
                     true,
                 )
+                .unwrap(),
+            AwsRequestOutcome::Pending { .. }
+        ));
+    }
+
+    #[test]
+    fn dismissed_aws_request_denies_only_the_current_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(directory.path().join("vault.json"));
+        controller.create_vault("correct horse").unwrap();
+        controller
+            .save_aws_configuration(aws_configuration())
+            .unwrap();
+        let requester = live_process();
+        let AwsRequestOutcome::Pending { id, receiver } = controller
+            .begin_aws_request("prod", vec![requester.clone()], true)
+            .unwrap()
+        else {
+            panic!("first request should be pending");
+        };
+
+        controller.dismiss_aws_request(&id).unwrap();
+
+        assert_eq!(receiver.recv().unwrap(), AwsRequestResolution::Denied);
+        let snapshot = controller.snapshot();
+        assert!(snapshot.aws_denials.is_empty());
+        assert_eq!(snapshot.audit[0].action, AuditAction::Denied);
+        assert_eq!(snapshot.audit[0].ttl_seconds, None);
+        assert!(matches!(
+            controller
+                .begin_aws_request("prod", vec![requester], true)
                 .unwrap(),
             AwsRequestOutcome::Pending { .. }
         ));

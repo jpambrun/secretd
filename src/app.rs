@@ -2312,7 +2312,7 @@ impl Render for RequestView {
     }
 }
 
-pub fn deny_oldest_request(cx: &mut App) {
+pub fn dismiss_oldest_request(cx: &mut App) {
     let snapshot = cx.global::<AppState>().snapshot();
     let deny_aws = match (snapshot.pending_aws.first(), snapshot.pending.first()) {
         (Some(aws), Some(secret)) => aws.requested_at <= secret.requested_at,
@@ -2324,7 +2324,7 @@ pub fn deny_oldest_request(cx: &mut App) {
         if let Some(request) = snapshot.pending_aws.first()
             && let Ok(mut controller) = controller.lock()
         {
-            let _ = controller.respond_aws(&request.id, None, None, None);
+            let _ = controller.dismiss_aws_request(&request.id);
         }
     } else if let Some(request) = snapshot.pending.first()
         && let Ok(mut controller) = controller.lock()
