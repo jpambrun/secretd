@@ -156,7 +156,6 @@ impl AppState {
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(tray_menu.clone()))
             .with_icon(tray_icon(tray_status).map_err(std::io::Error::other)?)
-            .with_icon_as_template(false)
             .with_tooltip("secretd")
             .with_menu_on_left_click(false)
             .build()?;
@@ -224,7 +223,7 @@ impl AppState {
             && *current != status
         {
             if let Ok(icon) = tray_icon(status) {
-                let _ = self.tray.set_icon_with_as_template(Some(icon), false);
+                let _ = self.tray.set_icon(Some(icon));
             }
             *current = status;
         }
@@ -410,6 +409,7 @@ impl MainView {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let value: SharedString = value.into();
         input.update(cx, |input, cx| input.set_value(value, window, cx));
     }
 
@@ -1434,6 +1434,14 @@ impl MainView {
                 "Grants",
                 "Manage temporary access grants and remembered denials.",
             ))
+            .when(!snapshot.aws_grants.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_color(rgb(MUTED))
+                        .text_sm()
+                        .child("Access changes apply to future credential requests. Issued AWS credentials remain valid until they expire."),
+                )
+            })
             .when(
                 snapshot.grants.is_empty()
                     && snapshot.aws_grants.is_empty()
@@ -1443,6 +1451,12 @@ impl MainView {
             .children(snapshot.aws_grants.iter().map(|grant| {
                 let revoke_id = grant.id.clone();
                 let extend_id = grant.id.clone();
+                let change_id = grant.id.clone();
+                let change_entity = entity.clone();
+                let (level, label) = match grant.level {
+                    AwsAccessLevel::ReadOnly => (AwsAccessLevel::Admin, "Switch to admin"),
+                    AwsAccessLevel::Admin => (AwsAccessLevel::ReadOnly, "Switch to read-only"),
+                };
                 card().child(
                     h_flex()
                         .gap_3()
@@ -1476,6 +1490,17 @@ impl MainView {
                                             duration_until(grant.expires_at)
                                         )),
                                 ),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("access-{change_id}")))
+                                .flex_shrink_0()
+                                .outline()
+                                .label(label)
+                                .on_click(move |_, _, cx| {
+                                    change_entity.update(cx, |this, cx| {
+                                        this.set_aws_grant_level(change_id.clone(), level, cx)
+                                    });
+                                }),
                         )
                         .child(action_button(
                             "Extend",
@@ -1595,6 +1620,27 @@ impl MainView {
     fn unblock_aws_denial(&mut self, id: String, cx: &mut Context<Self>) {
         if let Ok(mut controller) = Self::controller(cx).lock() {
             controller.revoke_aws_denial(&id);
+        }
+        Self::signal(cx);
+        cx.notify();
+    }
+
+    fn set_aws_grant_level(&mut self, id: String, level: AwsAccessLevel, cx: &mut Context<Self>) {
+        let result = Self::controller(cx)
+            .lock()
+            .map_err(|_| "secretd state is unavailable".to_string())
+            .and_then(|mut controller| {
+                controller
+                    .set_aws_grant_level(&id, level)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(()) => self.toast(
+                format!("AWS grant switched to {}", level.label()),
+                false,
+                cx,
+            ),
+            Err(error) => self.toast(error, true, cx),
         }
         Self::signal(cx);
         cx.notify();
@@ -2808,6 +2854,8 @@ fn audit_label(action: AuditAction) -> &'static str {
         AuditAction::TimedOut => "Request timed out",
         AuditAction::Revoked => "Access revoked",
         AuditAction::Unblocked => "Block removed",
+        AuditAction::AwsAccessChanged(AwsAccessLevel::Admin) => "Switched to admin",
+        AuditAction::AwsAccessChanged(AwsAccessLevel::ReadOnly) => "Switched to read-only",
     }
 }
 

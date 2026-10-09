@@ -90,5 +90,9 @@ remembered for 30 minutes for the same verified process lineage and profile, pre
 from repeatedly opening approval windows. Active grants and remembered denials appear under
 **Grants**, where they can be revoked or unblocked immediately.
 
+On **Grants**, AWS access can be switched between read-only and admin without changing the process
+boundary or expiration. The selected role applies to future credential requests. Credentials already
+issued by AWS remain usable until their expiration.
+
 The generic secret vault and `get` request remain compatible with the Deno implementation. Vaults
 that contain the Rust application's AWS extension require an AWS-aware secretd version.
