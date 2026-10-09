@@ -46,6 +46,7 @@ pub enum AuditAction {
     TimedOut,
     Revoked,
     Unblocked,
+    AwsAccessChanged(AwsAccessLevel),
 }
 
 #[derive(Clone, Debug)]
@@ -614,6 +615,37 @@ impl Controller {
         });
     }
 
+    pub fn set_aws_grant_level(
+        &mut self,
+        id: &str,
+        level: AwsAccessLevel,
+    ) -> Result<(), VaultError> {
+        if !self.vault.unlocked() {
+            return Err(VaultError("Vault is locked".into()));
+        }
+        self.prune_exited_aws_grants();
+        let grant = self
+            .aws_process_decisions
+            .iter_mut()
+            .find(|grant| grant.id == id)
+            .ok_or_else(|| VaultError("Grant is no longer active".into()))?;
+        if grant.level == level {
+            return Ok(());
+        }
+        grant.level = level;
+        let profile = grant.profile.clone();
+        let process = grant.process.clone();
+        self.record_audit(AuditEntry {
+            id: String::new(),
+            occurred_at: 0,
+            action: AuditAction::AwsAccessChanged(level),
+            secret: aws_audit_resource(&profile),
+            ttl_seconds: None,
+            process,
+        });
+        Ok(())
+    }
+
     pub fn extend_aws_grant(&mut self, id: &str) {
         let now = now_millis();
         if let Some(grant) = self
@@ -1003,6 +1035,122 @@ mod tests {
                 .unwrap(),
             AwsRequestOutcome::Pending { .. }
         ));
+    }
+
+    #[test]
+    fn aws_grant_access_can_change_without_changing_scope_or_expiration() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(directory.path().join("vault.json"));
+        controller.create_vault("correct horse").unwrap();
+        let mut configuration = aws_configuration();
+        let mut other_target = configuration.targets[0].clone();
+        other_target.profile = "dev".into();
+        configuration.targets.push(other_target);
+        controller.save_aws_configuration(configuration).unwrap();
+        let ancestor = live_process();
+        let child = process(20, "/usr/local/bin/terraform");
+        for profile in ["prod", "dev"] {
+            let AwsRequestOutcome::Pending { id, .. } = controller
+                .begin_aws_request(profile, vec![child.clone(), ancestor.clone()], true)
+                .unwrap()
+            else {
+                panic!("first request should require approval");
+            };
+            controller
+                .respond_aws(
+                    &id,
+                    Some(AwsAccessLevel::ReadOnly),
+                    Some(ancestor.clone()),
+                    None,
+                )
+                .unwrap();
+        }
+        let original = controller.snapshot().aws_grants[0].clone();
+        let other = controller.snapshot().aws_grants[1].clone();
+        for level in [AwsAccessLevel::Admin, AwsAccessLevel::ReadOnly] {
+            controller.set_aws_grant_level(&original.id, level).unwrap();
+            let snapshot = controller.snapshot();
+            assert_eq!(snapshot.aws_grants.len(), 2);
+            let grant = &snapshot.aws_grants[0];
+            assert_eq!(grant.id, original.id);
+            assert_eq!(grant.profile, original.profile);
+            assert!(same_process(&grant.process, &original.process));
+            assert_eq!(grant.created_at, original.created_at);
+            assert_eq!(grant.expires_at, original.expires_at);
+            assert_eq!(grant.level, level);
+            assert_eq!(snapshot.aws_grants[1].id, other.id);
+            assert_eq!(snapshot.aws_grants[1].level, other.level);
+            assert_eq!(
+                snapshot.audit[0].action,
+                AuditAction::AwsAccessChanged(level)
+            );
+            assert_eq!(snapshot.audit[0].secret, "aws/prod");
+            assert!(same_process(&snapshot.audit[0].process, &ancestor));
+            assert!(matches!(
+                controller
+                    .begin_aws_request("prod", vec![child.clone(), ancestor.clone()], true)
+                    .unwrap(),
+                AwsRequestOutcome::Immediate(actual) if actual == level
+            ));
+        }
+        assert!(matches!(
+            controller
+                .begin_aws_request("prod", vec![child, ancestor], false)
+                .unwrap(),
+            AwsRequestOutcome::Pending { .. }
+        ));
+    }
+
+    #[test]
+    fn aws_grant_access_changes_reject_inactive_grants_and_a_locked_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(directory.path().join("vault.json"));
+        controller.create_vault("correct horse").unwrap();
+        let now = now_millis();
+        for (id, process, expires_at) in [
+            ("expired", live_process(), now.saturating_sub(1)),
+            (
+                "exited",
+                process(u32::MAX, "/missing/terraform"),
+                now + DEFAULT_GRANT_SECONDS * 1_000,
+            ),
+            (
+                "revoked",
+                live_process(),
+                now + DEFAULT_GRANT_SECONDS * 1_000,
+            ),
+        ] {
+            controller.aws_process_decisions.push(AwsCredentialGrant {
+                id: id.into(),
+                profile: "prod".into(),
+                level: AwsAccessLevel::ReadOnly,
+                process,
+                created_at: now.saturating_sub(DEFAULT_GRANT_SECONDS * 1_000),
+                expires_at,
+            });
+        }
+        controller.revoke_aws_grant("revoked");
+        for id in ["expired", "exited", "revoked", "missing"] {
+            assert_eq!(
+                controller
+                    .set_aws_grant_level(id, AwsAccessLevel::Admin)
+                    .unwrap_err()
+                    .to_string(),
+                "Grant is no longer active"
+            );
+        }
+        let snapshot = controller.snapshot();
+        assert!(snapshot.aws_grants.is_empty());
+        assert_eq!(snapshot.audit.len(), 1);
+        assert_eq!(snapshot.audit[0].action, AuditAction::Revoked);
+        controller.lock();
+        assert_eq!(
+            controller
+                .set_aws_grant_level("missing", AwsAccessLevel::Admin)
+                .unwrap_err()
+                .to_string(),
+            "Vault is locked"
+        );
     }
 
     #[test]
